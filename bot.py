@@ -608,7 +608,9 @@ def inv_change(uid, name, delta):
 
 
 # ---------- command registration ----------
-ALIAS = {"bank": "balance", "lb": "leaderboard", "bj": "blackjack"}
+# Slack allows at most 25 slash commands per app, so there are no aliases:
+# /lb, /bank and /bj are gone, use /leaderboard, /balance and /blackjack.
+ALIAS = {}
 PUBLIC = {"rob", "give", "roulette", "roll", "rps", "ttt"}
 MENTION = {"rob", "give"}
 NOLOG = {"ecohelp", "audit"}
@@ -1770,7 +1772,7 @@ def catalog(uid, args):
             return f"*{r[0]}* | {fmt(r[1])}\n{r[2]}" if r else "❌ Item not found."
         rows = db.execute("SELECT name, price FROM items ORDER BY price").fetchall()
     if not rows:
-        return "❌ No items yet. An admin can use `/create-item`."
+        return "❌ No items yet. An admin can use `/admin create-item`."
     return "*🛒 Catalog*\n" + "\n".join(f"`{n}` • {fmt(p)}" for n, p in rows) + "\nDetails: `/catalog <item>`"
 
 
@@ -1812,26 +1814,20 @@ def use(uid, args):
     return f"✅ You used {amount}x `{args[0]}`."
 
 
-# ---------- admin ----------
-@cmd("add-money")
-def add_money(uid, args):
-    if uid not in ADMINS:
-        return "🔒 Admins only."
+# ---------- admin (all admin tools live under /admin now) ----------
+def add_money(args):
     if len(args) < 2 or not parse_user(args[0]):
-        return "❌ Usage: `/add-money @user <amount>`"
+        return "❌ Usage: `/admin add-money @user <amount>`"
     amt = parse_amount(args[1], MAX_COINS)
     if amt is None:
-        return "❌ Usage: `/add-money @user <amount>`"
+        return "❌ Usage: `/admin add-money @user <amount>`"
     change(parse_user(args[0]), cash=amt)
     return f"✅ Added {fmt(amt)} to {tag(parse_user(args[0]))}."
 
 
-@cmd("create-item", keep_case=True)
-def create_item(uid, args):
-    if uid not in ADMINS:
-        return "🔒 Admins only."
+def create_item(args):
     if len(args) < 3 or not args[1].isdigit():
-        return "❌ Usage: `/create-item <name> <price> <description>`"
+        return "❌ Usage: `/admin create-item <name> <price> <description>`"
     name = args[0].lower()
     with lock:
         db.execute("INSERT OR REPLACE INTO items VALUES (?,?,?)", (name, int(args[1]), " ".join(args[2:])))
@@ -1839,12 +1835,9 @@ def create_item(uid, args):
     return f"✅ Item `{name}` created for {fmt(int(args[1]))}."
 
 
-@cmd("delete-item")
-def delete_item(uid, args):
-    if uid not in ADMINS:
-        return "🔒 Admins only."
+def delete_item(args):
     if not args:
-        return "❌ Usage: `/delete-item <name>`"
+        return "❌ Usage: `/admin delete-item <name>`"
     return remove_item(args[0].lower())
 
 
@@ -1858,6 +1851,12 @@ def remove_item(name):
 
 ADMIN_HELP = (
     "*🛠 /admin commands*\n"
+    "`add-money @user <amount>`: give coins to a player\n"
+    "`create-item <name> <price> <description>`: put an item in the shop\n"
+    "`delete-item <name>`: remove an item from the shop\n"
+    "`audit @user`: see someone's last money moves\n"
+    "`set-decks <1-8>`: how many decks blackjack uses\n"
+    "`set-cooldown <usages> <duration>`: games allowed per time window (e.g. `4 5m`)\n"
     "`nuke @user`: wipe their cash and bank\n"
     "`nuke all confirm`: wipe EVERYONE's cash and bank\n"
     "`cap @user <amount>` / `cap all <amount>`: cut total coins down to the amount (cash first)\n"
@@ -1865,8 +1864,7 @@ ADMIN_HELP = (
     "`undo`: restore the last nuke/cap/set/take\n"
     "`resetcd @user|all`: clear cooldowns\n"
     "`ban @user` / `unban @user`: block from the economy · `info @user`: balance\n"
-    "`item-remove <name>`: delete an item (also `/delete-item`)\n"
-    "Money changes can be checked with `/audit @user`.")
+    "`item-remove <name>`: delete an item (same as `delete-item`)")
 
 
 def snapshot(uids):
@@ -1897,14 +1895,26 @@ def cap_total(u, amt):
     return True
 
 
-@cmd("admin")
+@cmd("admin", keep_case=True)
 def admin_cmd(uid, args):
     if uid not in ADMINS:
         return "🔒 Admins only."
-    if not args or args[0] == "help":
+    if not args or args[0].lower() == "help":
         return ADMIN_HELP
-    sub, rest = args[0], args[1:]
+    sub, rest = args[0].lower(), args[1:]
     tgt = parse_user(rest[0]) if rest else None
+    if sub == "add-money":
+        return add_money(rest)
+    if sub == "create-item":
+        return create_item(rest)
+    if sub == "delete-item":
+        return delete_item(rest)
+    if sub == "set-decks":
+        return set_blackjack_decks(rest)
+    if sub == "set-cooldown":
+        return set_game_cooldown(rest)
+    if sub == "audit":
+        return audit(rest)
     if sub == "nuke":
         if rest and rest[0] == "all":
             if rest[1:] != ["confirm"]:
@@ -1994,34 +2004,26 @@ def admin_cmd(uid, args):
     return ADMIN_HELP
 
 
-@cmd("set-blackjack-decks")
-def set_blackjack_decks(uid, args):
-    if uid not in ADMINS:
-        return "🔒 Admins only."
+def set_blackjack_decks(args):
     if not args or not args[0].isdigit() or not 1 <= int(args[0]) <= 8:
-        return "❌ Usage: `/set-blackjack-decks <1-8>`"
+        return "❌ Usage: `/admin set-decks <1-8>`"
     set_setting("bj_decks", int(args[0]))
     return f"✅ Blackjack now uses {args[0]} deck(s)."
 
 
-@cmd("set-game-cooldown")
-def set_game_cooldown(uid, args):
-    if uid not in ADMINS:
-        return "🔒 Admins only."
+def set_game_cooldown(args):
     secs = parse_duration(args[1]) if len(args) > 1 else None
     if len(args) < 2 or not args[0].isdigit() or int(args[0]) < 1 or not secs:
-        return "❌ Usage: `/set-game-cooldown <usages> <duration>`\nExample: `/set-game-cooldown 4 5m` (4 games per 5 minutes)"
+        return ("❌ Usage: `/admin set-cooldown <usages> <duration>`\n"
+                "Example: `/admin set-cooldown 4 5m` (4 games per 5 minutes)")
     set_setting("cd_uses", int(args[0]))
     set_setting("cd_secs", secs)
     return f"✅ Players can now play {args[0]} games per {secs}s."
 
 
-@cmd("audit")
-def audit(uid, args):
-    if uid not in ADMINS:
-        return "🔒 Admins only."
+def audit(args):
     if not args or not parse_user(args[0]):
-        return "❌ Usage: `/audit @user`"
+        return "❌ Usage: `/admin audit @user`"
     target = parse_user(args[0])
     with lock:
         rows = db.execute("SELECT ts, cash, bank, why FROM log WHERE uid=? ORDER BY ts DESC LIMIT 20",
@@ -2038,22 +2040,21 @@ INTRO = ("Yo, this is my gambling bot. Type `/` in the chat box to see every com
          "or `/ecohelp` to get this list again:")
 
 PLAIN_COMMANDS = (
-    "/balance · /bank · /deposit · /withdraw · /give · /leaderboard · /lb · /stats · "
-    "/work · /crime · /rob · /collect · /blackjack · /bj · /slots · /higher-lower · "
+    "/balance · /deposit · /withdraw · /give · /leaderboard · /stats · "
+    "/work · /crime · /rob · /collect · /blackjack · /slots · /higher-lower · "
     "/russian-roulette · /rps · /roulette · /ttt · /roll · /catalog · /buy · /inventory · "
-    "/use · /ecohelp · /add-money · /create-item · /delete-item · /audit · "
-    "/set-blackjack-decks · /set-game-cooldown · /admin"
+    "/use · /ecohelp · /admin"
 )
 
 
 def help_blocks(admin=False):
     parts = [
         f"*💰 Money*\n"
-        "`/bank [@user]` – see your cash, bank and net worth (also `/balance`). Cash can be robbed, bank can't.\n"
+        "`/balance [@user]` – see your cash, bank and net worth. Cash can be robbed, bank can't.\n"
         "`/deposit <amount|half|all>` – move cash into your bank so nobody can rob it.\n"
         "`/withdraw <amount|half|all>` – take money out of the bank.\n"
         "`/give @user <amount>` – send cash to someone. They get pinged.\n"
-        "`/lb` – leaderboard: the richest players, 10 per page, and your own rank (also `/leaderboard`).\n"
+        "`/leaderboard` – the richest players, 10 per page, and your own rank.\n"
         "`/stats` – how many coins exist in total.",
 
         "*⛏️ Earn coins*\n"
@@ -2065,9 +2066,9 @@ def help_blocks(admin=False):
         "💬 Just chatting gives 10-30 coins every 30s.",
 
         "*🎰 Games vs the bot* (only you see them)\n"
-        "`/bj <bet>` – blackjack (also `/blackjack`). Beat the dealer without going over 21. "
+        "`/blackjack <bet>` – beat the dealer without going over 21. "
         "Win pays 2x, a 21 pays 3x, natural blackjack 5x. Buttons: Hit, Stand, Double Down. "
-        "Or `/bj @user [bet]` to play a person: highest hand up to 21 wins.\n"
+        "Or `/blackjack @user [bet]` to play a person: highest hand up to 21 wins.\n"
         "`/slots <bet>` – 3 reels. Pair 1x, three of a kind 4x, up to 30x for triple 7️⃣.\n"
         "`/higher-lower <bet>` – guess if the next card is higher or lower. Riskier guesses pay more.\n"
         "`/russian-roulette <bet>` – 1 bullet in 6. Survive and win 20%, else lose the bet.\n"
@@ -2093,14 +2094,15 @@ def help_blocks(admin=False):
         "`k` `m` `b` `t` `q` `qi` `z` `y` (so `9qi` = 9,000,000,000,000,000,000). There are no bet limits. "
         "Payouts shrink a little when you're very rich (over 100k) so nobody snowballs forever. "
         "Money and solo-game commands are only visible to you; rob, give, roulette and challenges are public.\n"
-        "🏆 Top the `/lb` and you can win prizes too! ⭐ = one star per quintillion you hold.",
+        "🏆 Top the `/leaderboard` and you can win prizes too! ⭐ = one star per quintillion you hold.",
     ]
     if admin:
         parts.append("*🛠 Admin (only you can see this)*\n"
-                     "`/admin help` lists the admin tools (nuke, cap, set, take, undo, ban, item-remove…)\n"
-                     "`/add-money @user <amount>` · `/create-item <name> <price> <description>` · `/delete-item <name>` · `/audit @user`\n"
-                     "`/set-blackjack-decks <1-8>` · "
-                     "`/set-game-cooldown <usages> <duration>` (e.g. `4 5m`)")
+                     "`/admin help` lists every admin tool (nuke, cap, set, take, undo, ban, item-remove…)\n"
+                     "`/admin add-money @user <amount>` · `/admin create-item <name> <price> <description>` · "
+                     "`/admin delete-item <name>` · `/admin audit @user`\n"
+                     "`/admin set-decks <1-8>` · "
+                     "`/admin set-cooldown <usages> <duration>` (e.g. `4 5m`)")
     parts.append(f"*📋 All commands*\n{PLAIN_COMMANDS}")
     return [section(INTRO)] + [section(p) for p in parts]
 
