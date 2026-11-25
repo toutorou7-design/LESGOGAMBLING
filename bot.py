@@ -10,15 +10,21 @@ if "SLACK_BOT_TOKEN" not in os.environ or "SLACK_APP_TOKEN" not in os.environ:
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
+# Look up our own bot user ID so @Hakari works via BOTH app_mention AND message events
+try:
+    BOT_UID = app.client.auth_test()["user_id"]
+    print(f"Authenticated as bot user ID: {BOT_UID}")
+except Exception as e:
+    BOT_UID = None
+    print("auth_test failed:", repr(e))
+
 ADMINS = {"U0C7S6T72DD"}  # Slack member IDs allowed to use admin commands (also hidden from /lb)
+MAX_COINS = 9_000_000_000_000_000_000  # stay safely under SQLite 64-bit signed int limit (9.22e18)
 
 # ---------- database ----------
 SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eco.db")  # a copy shipped in the code repo
 
 # ---------- free cloud backup of the coins (private GitHub repo) ----------
-# Set GITHUB_TOKEN (fine-grained token, "Contents: read & write" on ONE private repo)
-# and GITHUB_REPO ("yourname/hakari-data"). The database is restored on start and
-# saved every 60 seconds when something changed, so coins survive restarts on hosts with a wiped disk.
 import base64, json, shutil, signal, urllib.request, urllib.error
 
 
@@ -33,8 +39,6 @@ def _clean_repo(r):
 
 GH_TOKEN = (os.environ.get("GITHUB_TOKEN") or "").strip() or None
 GH_REPO = _clean_repo(os.environ.get("GITHUB_REPO")) or None
-# With the cloud backup on, the live database is a separate file that is ALWAYS loaded from the
-# backup at startup. An old eco.db that sits in the code repo is never used as the live database.
 DB_PATH = (os.path.join(os.path.dirname(os.path.abspath(__file__)), "hakari_live.db")
            if (GH_TOKEN and GH_REPO) else SEED_PATH)
 GH_URL = f"https://api.github.com/repos/{GH_REPO}/contents/eco.db"
@@ -139,7 +143,7 @@ def backup_db(force=False):
                     if e.code in (409, 422):
                         print("!! Backup changed under us: is ANOTHER copy of the bot running? "
                               "(stop your Mac's copy / old deploys)")
-                    gh_sha = None  # out of date, refetch and retry
+                    gh_sha = None
                     payload.pop("sha", None)
                     time.sleep(2 * (attempt + 1))
                     continue
@@ -158,30 +162,35 @@ def backup_loop():
 restore_db()
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 lock = threading.RLock()
-db.execute("CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY, cash TEXT DEFAULT '100', bank TEXT DEFAULT '0')")
+db.execute("CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY, cash INTEGER DEFAULT 100, bank INTEGER DEFAULT 0)")
 db.execute("CREATE TABLE IF NOT EXISTS cooldowns (uid TEXT, action TEXT, ts REAL, PRIMARY KEY (uid, action))")
 db.execute("CREATE TABLE IF NOT EXISTS items (name TEXT PRIMARY KEY, price INTEGER, description TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS inv (uid TEXT, name TEXT, amount INTEGER, PRIMARY KEY (uid, name))")
-db.execute("CREATE TABLE IF NOT EXISTS log (ts REAL, uid TEXT, cash TEXT, bank TEXT, why TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS log (ts REAL, uid TEXT, cash INTEGER, bank INTEGER, why TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, val TEXT)")
-db.execute("CREATE TABLE IF NOT EXISTS snap (uid TEXT PRIMARY KEY, cash TEXT, bank TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS snap (uid TEXT PRIMARY KEY, cash INTEGER, bank INTEGER)")
 for col in ("name TEXT", "last_seen REAL"):
     try:
         db.execute(f"ALTER TABLE users ADD COLUMN {col}")
     except sqlite3.OperationalError:
         pass
+db.execute("UPDATE users SET last_seen=? WHERE last_seen IS NULL AND (cash+bank) > 100", (time.time(),))
 db.commit()
 
-COIN = os.environ.get("COIN", "🪙")  # normal Slack coin. Set COIN in Render only if you want another icon
-COOLDOWNS = {"work": 60, "crime": 60, "rob": 120, "collect": 86400}  # seconds (admins have none)
-GAME_TIMEOUT = 300  # seconds before an unfinished game is cleaned up
-PVP_BONUS = 1       # extra bets the house adds to the winner of a person-vs-person game (0 = zero-sum, safest vs alts)
+COIN = os.environ.get("COIN", "🪙")
+COOLDOWNS = {"work": 60, "crime": 60, "rob": 120, "collect": 86400}
+GAME_TIMEOUT = 300
+PVP_BONUS = 1
 CHAT_COOLDOWN = 30
 CHAT_MIN, CHAT_MAX = 10, 30
 chat_last = {}
-ACTIVE_DAYS = 3     # people who haven't used the bot for this long can't be robbed
-LOG_CHANNEL = os.environ.get("LOG_CHANNEL", "gamblelogs")  # every command is logged here
+ACTIVE_DAYS = 3
+LOG_CHANNEL = os.environ.get("LOG_CHANNEL", "gamblelogs")
 C_GREEN, C_RED, C_GOLD, C_BLUE, C_GREY = "#2ecc71", "#e74c3c", "#f1c40f", "#3498db", "#95a5a6"
+
+
+def clamp(n):
+    return max(-MAX_COINS, min(MAX_COINS, int(n)))
 
 
 def fmt(n):
@@ -198,20 +207,22 @@ def ordinal(n):
 
 def get(uid):
     with lock:
-        db.execute("INSERT OR IGNORE INTO users (uid, cash, bank) VALUES (?, '100', '0')", (uid,))
+        db.execute("INSERT OR IGNORE INTO users (uid) VALUES (?)", (uid,))
         db.commit()
-        cash, bank = db.execute("SELECT cash, bank FROM users WHERE uid=?", (uid,)).fetchone()
-        return int(cash), int(bank)
+        c, b = db.execute("SELECT cash, bank FROM users WHERE uid=?", (uid,)).fetchone()
+        return int(c or 0), int(b or 0)
 
 
 def change(uid, cash=0, bank=0):
-    cur_cash, cur_bank = get(uid)
-    new_cash = str(cur_cash + int(cash))
-    new_bank = str(cur_bank + int(bank))
-    why = sys._getframe(1).f_code.co_name  # which function moved the money (see /audit)
+    cur_c, cur_b = get(uid)
+    new_c = clamp(cur_c + int(cash))
+    new_b = clamp(cur_b + int(bank))
+    dc = new_c - cur_c
+    db_delta = new_b - cur_b
+    why = sys._getframe(1).f_code.co_name
     with lock:
-        db.execute("UPDATE users SET cash=?, bank=? WHERE uid=?", (new_cash, new_bank, uid))
-        db.execute("INSERT INTO log VALUES (?,?,?,?,?)", (time.time(), uid, str(int(cash)), str(int(bank)), why))
+        db.execute("UPDATE users SET cash=?, bank=? WHERE uid=?", (new_c, new_b, uid))
+        db.execute("INSERT INTO log VALUES (?,?,?,?,?)", (time.time(), uid, dc, db_delta, why))
         if random.random() < 0.01:
             db.execute("DELETE FROM log WHERE ts < ?", (time.time() - 7 * 86400,))
         db.commit()
@@ -254,7 +265,6 @@ name_cache = {}
 
 
 def name_of(uid):
-    """Real display name (needs the users:read scope); falls back to the saved handle."""
     if uid in name_cache:
         return name_cache[uid]
     try:
@@ -275,7 +285,6 @@ MARK = re.compile(r"⟦(\w+)⟧")
 
 
 def tag(uid):
-    """Placeholder for a person: becomes a real @ping or a bold display name right before sending."""
     return f"⟦{uid}⟧"
 
 
@@ -285,7 +294,6 @@ def render(obj, ping):
             if ping:
                 return f"<@{m.group(1)}>"
             n = name_of(m.group(1))
-            # already inside *bold*? then plain name, otherwise we get **Name*'s
             return n if obj.count("*", 0, m.start()) % 2 else f"*{n}*"
         return MARK.sub(sub, obj)
     if isinstance(obj, dict):
@@ -295,7 +303,7 @@ def render(obj, ping):
     return obj
 
 
-# ---------- pretty messages (coloured bar like an embed) ----------
+# ---------- pretty messages ----------
 def section(text, fields=None):
     b = {"type": "section", "text": {"type": "mrkdwn", "text": text}}
     if fields:
@@ -329,7 +337,6 @@ def embed(text, color=C_BLUE, fields=None, buttons=None, footer=None, rt="epheme
 
 
 def wire(d):
-    """Slack shows `text` AND the attachment when both are sent (double message). Send only the attachment."""
     d = dict(d)
     if d.get("attachments"):
         d.pop("text", None)
@@ -337,7 +344,6 @@ def wire(d):
 
 
 def swap(respond, view):
-    """Replace the message a button was clicked on."""
     v = wire(render(view, False))
     respond(replace_original=True, **v)
 
@@ -346,7 +352,7 @@ def only_you(respond, text):
     respond(text=text, replace_original=False, response_type="ephemeral")
 
 
-# ---------- #gamblelogs: every command is written here ----------
+# ---------- #gamblelogs ----------
 log_q = queue.Queue()
 LOG_CH = LOG_CHANNEL if re.match(r"^[CG][A-Z0-9]{8,}$", LOG_CHANNEL) else "#" + LOG_CHANNEL.lstrip("#")
 
@@ -370,7 +376,6 @@ threading.Thread(target=_log_worker, daemon=True).start()
 
 # ---------- cooldowns, game limits ----------
 def cooldown_left(uid, action, start=True):
-    """Seconds left. If 0 and start=True, the cooldown (re)starts now."""
     if uid in ADMINS:
         return 0
     now = time.time()
@@ -405,12 +410,11 @@ def parse_duration(t):
 
 
 def game_gate(uid):
-    """Max N games per window (set with /set-game-cooldown). Returns an error text or None."""
     if uid in ADMINS:
         return None
     uses, secs = setting("cd_uses", 0), setting("cd_secs", 60)
     if uses <= 0:
-        return None  # no limit unless an admin sets one with /set-game-cooldown
+        return None
     now = time.time()
     h = [t for t in game_hist.get(uid, []) if now - t < secs]
     if len(h) >= uses:
@@ -426,10 +430,12 @@ def parse_amount(text, maximum):
         return maximum
     if t == "half":
         return maximum // 2
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([km]?)", t)
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmbtq]?)", t)
     if not m:
         return None
-    return int(float(m.group(1)) * {"": 1, "k": 1000, "m": 1000000}[m.group(2)])
+    mults = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000,
+             "t": 1_000_000_000_000, "q": 1_000_000_000_000_000}
+    return clamp(int(float(m.group(1)) * mults[m.group(2)]))
 
 
 def parse_user(text):
@@ -438,7 +444,6 @@ def parse_user(text):
 
 
 def check_bet(uid, args, game):
-    """Returns (bet, None) or (None, error text). Handles k/half/all and the game cooldown. No bet size limits."""
     cash, _ = get(uid)
     bet = parse_amount(args[0], cash) if args else None
     if not bet or bet <= 0 or bet > cash:
@@ -450,12 +455,10 @@ def check_bet(uid, args, game):
 
 
 def with_usage(err, usage):
-    """Add the usage hint to real mistakes only, not to 'slow down' messages."""
     return err + usage if err.startswith("❌") else err
 
 
 def wealth_factor(uid):
-    """Payouts shrink as you get richer so nobody snowballs forever (x1 -> x0.55)."""
     c, b = get(uid)
     for limit, f in ((100_000_000, .55), (10_000_000, .65), (1_000_000, .75), (100_000, .85)):
         if c + b >= limit:
@@ -482,10 +485,10 @@ def inv_change(uid, name, delta):
 
 # ---------- command registration ----------
 ALIAS = {"bank": "balance", "lb": "leaderboard", "bj": "blackjack"}
-PUBLIC = {"rob", "give", "roulette", "roll", "rps", "ttt"}  # everything else is only visible to you
-MENTION = {"rob", "give"}                                    # public AND pings both people
+PUBLIC = {"rob", "give", "roulette", "roll", "rps", "ttt"}
+MENTION = {"rob", "give"}
 NOLOG = {"ecohelp", "audit"}
-cur = threading.local()  # channel / response_url of the command being handled
+cur = threading.local()
 
 
 def cmd(name, keep_case=False):
@@ -501,16 +504,15 @@ def cmd(name, keep_case=False):
                 m = re.match(r"<@(\w+)\|([^>]+)>", t)
                 if m:
                     set_name(m.group(1), m.group(2))
-            # lowercase everything except @mentions (user IDs are case-sensitive)
             args = tokens if keep_case else [t if t.startswith("<") else t.lower() for t in tokens]
             cur.channel, cur.url = command.get("channel_id"), command.get("response_url")
             if uid not in ADMINS and setting(f"ban:{uid}", 0):
                 respond("🔒 You're blocked from the economy.", response_type="ephemeral")
                 return
             try:
-                with lock:  # one command at a time: no double-spending with fast clicks
+                with lock:
                     out = fn(uid, args)
-            except Exception as e:
+            except Exception:
                 import traceback
                 traceback.print_exc()
                 respond("Something broke 😅 check the terminal.", response_type="ephemeral")
@@ -545,7 +547,6 @@ def show_help(ack, body, respond):
             response_type="ephemeral")
 
 
-# "Remind me" buttons: pings you (only you see it) when a cooldown is over
 reminders = set()
 
 
@@ -631,25 +632,18 @@ LB_SIZE = 10
 def lb_view(uid, page):
     with lock:
         adm = list(ADMINS)
-        rows = db.execute("SELECT uid, cash, bank FROM users").fetchall()
-        eligible = []
-        for u, c, b in rows:
-            if u in adm:
-                continue
-            tot = int(c) + int(b)
-            if tot > 0:
-                eligible.append((u, tot))
-        eligible.sort(key=lambda x: (-x[1], x[0]))
-        total = len(eligible)
+        marks = ",".join("?" * len(adm))
+        total = db.execute(f"SELECT COUNT(*) FROM users WHERE cash+bank > 0 AND uid NOT IN ({marks})", adm).fetchone()[0]
         pages = max(1, -(-total // LB_SIZE))
         page = max(1, min(page, pages))
-        start = (page - 1) * LB_SIZE
-        page_rows = eligible[start:start + LB_SIZE]
+        rows = db.execute(f"SELECT uid, cash+bank AS t FROM users WHERE cash+bank > 0 AND uid NOT IN ({marks}) "
+                          f"ORDER BY t DESC, uid LIMIT ? OFFSET ?", adm + [LB_SIZE, (page - 1) * LB_SIZE]).fetchall()
         mine = sum(get(uid))
-        rank = sum(1 for u, tot in eligible if tot > mine) + 1
+        rank = db.execute(f"SELECT COUNT(*) FROM users WHERE uid NOT IN ({marks}) AND cash+bank > ?", adm + [mine]).fetchone()[0] + 1
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    start = (page - 1) * LB_SIZE
     lines = "\n".join(f"{medals.get(start + i, f'`{start + i}.`')} {tag(u)} • {fmt(t)}"
-                      for i, (u, t) in enumerate(page_rows, 1))
+                      for i, (u, t) in enumerate(rows, 1))
     buttons = []
     if page > 1:
         buttons.append(btn("◀ Prev", "lb_page", f"{uid}:{page - 1}"))
@@ -677,8 +671,8 @@ def lb_page(ack, body, respond, action):
 def stats(uid, args):
     with lock:
         rows = db.execute("SELECT cash, bank FROM users").fetchall()
-    cash = sum(int(c) for c, _ in rows)
-    bank = sum(int(b) for _, b in rows)
+    cash = sum(int(c or 0) for c, _ in rows)
+    bank = sum(int(b or 0) for _, b in rows)
     return (f"*📊 Economy stats*\nPlayers: {len(rows):,}\nTotal cash: {fmt(cash)}\n"
             f"Total bank: {fmt(bank)}\nTotal: {fmt(cash + bank)}")
 
@@ -704,7 +698,6 @@ CRIME_FAIL = ["trying to steal a cat", "shoplifting", "hacking the school wifi",
 
 @cmd("crime")
 def crime(uid, args):
-    """60% to win 200-900. If you fail you are fined 10-20% of your cash (at least 25, the rest comes from your bank)."""
     left = cooldown_left(uid, "crime")
     if left:
         return wait_view("crime", left)
@@ -725,8 +718,6 @@ def crime(uid, args):
 
 @cmd("rob")
 def rob(uid, args):
-    """50% to steal 40-90% of the target's cash. If you fail you pay them 15-30% of yours (min 50).
-    You need 100+ cash to try, the target must be active and hold 50+ cash."""
     if not args or not parse_user(args[0]):
         return "❌ Usage: `/rob @user`"
     target = parse_user(args[0])
@@ -753,7 +744,7 @@ def rob(uid, args):
         return f"🕶️ {tag(uid)} robbed {tag(target)} and took {fmt(win)} ({pct}% of their cash)!"
     loss = min(my_cash, max(50, int(my_cash * random.randint(15, 30) / 100)))
     change(uid, cash=-loss)
-    change(target, cash=loss)  # the victim gets the fine
+    change(target, cash=loss)
     return f"🚔 {tag(uid)} got caught robbing {tag(target)} and had to pay them {fmt(loss)}!"
 
 
@@ -766,15 +757,58 @@ def collect(uid, args):
     return f"🎁 You collected your daily reward of {fmt(1000)} (to bank)."
 
 
-# ---------- chatting earns coins ----------
+# ---------- chatting earns coins + fallback @mention detector ----------
+mention_seen = {}  # event_ts -> timestamp (prevents double-reply if both app_mention and message fire)
+
+
+def post_commands_mention(event, say):
+    ev_id = event.get("client_msg_id") or event.get("ts")
+    now = time.time()
+    # prune old entries
+    for k, ts in list(mention_seen.items()):
+        if now - ts > 60:
+            mention_seen.pop(k, None)
+    if ev_id and ev_id in mention_seen:
+        return
+    if ev_id:
+        mention_seen[ev_id] = now
+
+    print("Replying to @Hakari mention from:", event.get("user"), "in channel:", event.get("channel"))
+    kwargs = {"text": INTRO, "blocks": help_blocks(False)}
+    thread = event.get("thread_ts") or event.get("ts")
+    if thread:
+        kwargs["thread_ts"] = thread
+    try:
+        say(**kwargs)
+    except Exception as e:
+        print("app_mention thread reply failed, trying channel root:", repr(e))
+        try:
+            say(text=INTRO, blocks=help_blocks(False))
+        except Exception as e2:
+            print("app_mention reply completely failed:", repr(e2))
+
+
+@app.event("app_mention")
+def on_mention(event, say):
+    post_commands_mention(event, say)
+
+
 @app.event("message")
-def on_message(event):
-    # ignore bots, edits, joins, DMs, etc.
-    if event.get("subtype") or event.get("bot_id") or event.get("channel_type") == "im":
+def on_message(event, say):
+    # ignore bots, edits, joins, etc.
+    if event.get("subtype") or event.get("bot_id"):
         return
     uid = event.get("user")
     text = (event.get("text") or "").strip()
-    if not uid or len(text) < 3:
+    if not uid:
+        return
+
+    # If someone mentions @Hakari anywhere in a message (including line 2), reply with commands!
+    if BOT_UID and f"<@{BOT_UID}>" in text:
+        post_commands_mention(event, say)
+        return
+
+    if event.get("channel_type") == "im" or len(text) < 3:
         return
     now = time.time()
     if now - chat_last.get(uid, 0) < CHAT_COOLDOWN:
@@ -788,7 +822,6 @@ def on_message(event):
 
 @cmd("roll", keep_case=True)
 def roll(uid, args):
-    """/roll -> d6, /roll 20 -> 1-20, /roll pizza, more pizza, pineapple -> picks one"""
     text = " ".join(args).strip()
     if not text:
         n = random.randint(1, 6)
@@ -805,9 +838,8 @@ def roll(uid, args):
     return f"🎲 {tag(uid)} asks the dice… *{random.choice(options)}* wins!"
 
 
-# ---------- solo games (private: only the player sees them) ----------
+# ---------- solo games ----------
 def refund_later(store, gid):
-    """Refund a solo game nobody finished (only used where abandoning gives no advantage)."""
     def go():
         with lock:
             g = store.pop(gid, None)
@@ -865,7 +897,6 @@ def bj_finish(g, natural=False):
     while hand_val(g["d"]) < 17 and p <= 21:
         g["d"].append(g["deck"].pop())
     d, bet, uid = hand_val(g["d"]), g["bet"], g["uid"]
-    # profit multipliers: win 2x, win with 21 3x, natural blackjack 5x (scaled down for rich players)
     if p > 21:
         label, profit = "Bust", -bet
     elif natural and d != 21:
@@ -886,7 +917,6 @@ def bj_finish(g, natural=False):
 
 
 def bj_timeout(gid):
-    """Walked away from a hand? It auto-stands (no free refund for abandoning a bad hand)."""
     with lock:
         g = games.get(gid)
         if g:
@@ -897,7 +927,7 @@ def bj_new(uid, bet_text):
     bet, err = check_bet(uid, [bet_text], "blackjack")
     if err:
         return with_usage(err, "\nUsage: `/bj <bet|half|all>`")
-    change(uid, cash=-bet)  # bet is held until the game ends
+    change(uid, cash=-bet)
     decks = max(1, min(8, setting("bj_decks", 3)))
     deck = [(r, s) for _ in range(decks) for r in range(1, 14) for s in SUITS]
     random.shuffle(deck)
@@ -916,7 +946,7 @@ def bj_new(uid, bet_text):
 @cmd("blackjack")
 def blackjack(uid, args):
     if args and args[0].startswith("<"):
-        return make_challenge(uid, args, "bj")  # blackjack vs a person
+        return make_challenge(uid, args, "bj")
     return bj_new(uid, args[0] if args else "")
 
 
@@ -948,7 +978,7 @@ def bj_action(ack, body, respond, action):
         swap(respond, bj_view(g, True))
 
 
-# ----- "play again" buttons for the quick games -----
+# ----- "play again" buttons -----
 def again_dispatch(kind, uid, bet_text):
     return {"bj": bj_new, "slots": slots_play, "hl": hl_play, "rr": rr_play}[kind](uid, bet_text)
 
@@ -971,7 +1001,7 @@ def again_action(ack, body, respond, action):
 
 # ----- slots -----
 SLOT_SYMS = ["🍒", "🍋", "🍊", "🍇", "🔔", "💎", "7️⃣"]
-SLOT_TRIPLE = {"7️⃣": 30, "💎": 15, "🔔": 8}  # every other symbol: 4x. A pair pays 1x.
+SLOT_TRIPLE = {"7️⃣": 30, "💎": 15, "🔔": 8}
 
 
 def slots_play(uid, bet_text):
@@ -1102,12 +1132,12 @@ BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
 
 @cmd("rps")
 def rps(uid, args):
-    if args and args[0].startswith("<"):  # /rps @user [bet] -> play another person
+    if args and args[0].startswith("<"):
         return make_challenge(uid, args, "rps")
     bet, err = check_bet(uid, args, "rps")
     if err:
         return with_usage(err, "\nUsage: `/rps <bet|half|all>` (vs the bot) or `/rps @user [bet]` (vs a person)")
-    change(uid, cash=-bet)  # held until the game ends
+    change(uid, cash=-bet)
     gid = uuid.uuid4().hex[:8]
     rps_games[gid] = {"gid": gid, "uid": uid, "bet": bet}
     refund_later(rps_games, gid)
@@ -1116,7 +1146,6 @@ def rps(uid, args):
                  buttons=buttons + [HELP_BTN])
 
 
-# NOTE: patterns are anchored (^...$) so "prps_rock" (2-player buttons) never matches "rps_rock"
 @app.action(re.compile(r"^rps_(rock|paper|scissors)$"))
 def rps_action(ack, body, respond, action):
     ack()
@@ -1146,14 +1175,13 @@ def rps_action(ack, body, respond, action):
                             color, nolog=True, buttons=[HELP_BTN]))
 
 
-# ---------- roulette: shared table, everybody in the channel can join ----------
+# ---------- roulette ----------
 RED = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
-roulette_games = {}  # channel id -> running game
-ROUL_JOIN, ROUL_MAX = 10, 60  # seconds after each bet / total
+roulette_games = {}
+ROUL_JOIN, ROUL_MAX = 10, 60
 
 
 def roulette_space(space):
-    """-> (label, profit multiplier, test(number)) or None"""
     if space in ("red", "black"):
         return space, 2, lambda n: n != 0 and ((n in RED) == (space == "red"))
     if space in ("odd", "even"):
@@ -1184,7 +1212,7 @@ def roulette(uid, args):
     if err:
         return with_usage(err, ROUL_USAGE)
     ch, now = cur.channel, time.time()
-    change(uid, cash=-bet)  # held until the wheel stops
+    change(uid, cash=-bet)
     g = roulette_games.get(ch)
     new = g is None
     if new:
@@ -1240,9 +1268,9 @@ def roulette_spin(ch):
             print("roulette result could not be posted:", repr(e2))
 
 
-# ---------- 2-player games: challenges, rock paper scissors, tic tac toe (public) ----------
-challenges = {}  # waiting for the other person to accept
-pvp = {}         # running 2-player games
+# ---------- 2-player games ----------
+challenges = {}
+pvp = {}
 GAME_NAMES = {"rps": "Rock Paper Scissors", "ttt": "Tic Tac Toe", "bj": "Blackjack"}
 
 
@@ -1251,7 +1279,6 @@ def stake_text(bet):
 
 
 def pvp_win(winner, bet):
-    """Pays the winner both bets + the house bonus. Returns the gain."""
     bonus = bet * PVP_BONUS
     change(winner, cash=bet * 2 + bonus)
     return bet + bonus
@@ -1268,7 +1295,6 @@ def forget_challenge(gid):
 
 
 def arm(g):
-    """(Re)start the inactivity timer for a running game."""
     if g.get("timer"):
         g["timer"].cancel()
     t = threading.Timer(GAME_TIMEOUT, expire, args=(g["gid"],))
@@ -1311,7 +1337,6 @@ def make_challenge(uid, args, kind):
     t = threading.Timer(GAME_TIMEOUT, forget_challenge, args=(gid,))
     t.daemon = True
     t.start()
-    # the challenged person is the only one who gets a real @ping
     text = f"<@{target}> {tag(uid)} challenges you to *{GAME_NAMES[kind]}* ({stake_text(bet)})!"
     return {"text": text, "response_type": "in_channel", "blocks": [
         section(text),
@@ -1349,7 +1374,7 @@ def ch_action(ack, body, respond, action):
             replace(respond, "❌ Challenge cancelled: someone can't afford the bet.")
             return
         challenges.pop(gid)
-        change(c["a"], cash=-bet)  # both bets are held until the game ends
+        change(c["a"], cash=-bet)
         change(c["b"], cash=-bet)
         g = {"gid": gid, "kind": c["kind"], "a": c["a"], "b": c["b"], "bet": bet,
              "url": body.get("response_url"), "timer": None}
@@ -1423,7 +1448,7 @@ def prps_action(ack, body, respond, action):
         replace(respond, head + res)
 
 
-# --- 2-player blackjack: each person has their own hand, highest total up to 21 wins ---
+# --- 2-player blackjack ---
 def bj2_state(g, u):
     v = hand_val(g["h"][u])
     return "💥 bust" if v > 21 else ("✋ stood" if u in g["done"] else "🤔 playing")
@@ -1438,7 +1463,6 @@ def bj2_view(g):
 
 
 def bj2_result(g):
-    """Pays out and returns the final message text."""
     a, b, bet = g["a"], g["b"], g["bet"]
     va, vb = hand_val(g["h"][a]), hand_val(g["h"][b])
     sa, sb = (0 if va > 21 else va), (0 if vb > 21 else vb)
@@ -1495,7 +1519,7 @@ def pbj_action(ack, body, respond, action):
         only_you(respond, mine())
 
 
-# --- tic tac toe (board is emoji text + a dropdown, because Slack mobile stacks buttons vertically) ---
+# --- tic tac toe ---
 LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
 CELL = {None: "⬜", "X": "❌", "O": "⭕"}
 NUMS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
@@ -1625,15 +1649,18 @@ def use(uid, args):
     return f"✅ You used {amount}x `{args[0]}`."
 
 
-# ---------- admin (hidden from the help everyone sees; replies only visible to the admin, logged in #gamblelogs) ----------
+# ---------- admin ----------
 @cmd("add-money")
 def add_money(uid, args):
     if uid not in ADMINS:
         return "🔒 Admins only."
-    if len(args) < 2 or not parse_user(args[0]) or not args[1].isdigit():
+    if len(args) < 2 or not parse_user(args[0]):
         return "❌ Usage: `/add-money @user <amount>`"
-    change(parse_user(args[0]), cash=int(args[1]))
-    return f"✅ Added {fmt(int(args[1]))} to {tag(parse_user(args[0]))}."
+    amt = parse_amount(args[1], MAX_COINS)
+    if amt is None:
+        return "❌ Usage: `/add-money @user <amount>`"
+    change(parse_user(args[0]), cash=amt)
+    return f"✅ Added {fmt(amt)} to {tag(parse_user(args[0]))}."
 
 
 @cmd("create-item", keep_case=True)
@@ -1684,13 +1711,13 @@ def snapshot(uids):
         db.execute("DELETE FROM snap")
         for u in uids:
             c, b = get(u)
-            db.execute("INSERT INTO snap VALUES (?,?,?)", (u, str(c), str(b)))
+            db.execute("INSERT INTO snap VALUES (?,?,?)", (u, c, b))
         db.commit()
 
 
 def set_money(u, cash, bank):
     c, b = get(u)
-    change(u, cash=int(cash) - c, bank=int(bank) - b)
+    change(u, cash=clamp(cash) - c, bank=clamp(bank) - b)
 
 
 def all_uids():
@@ -1738,10 +1765,14 @@ def admin_cmd(uid, args):
         n = sum(cap_total(u, amt) for u in ids)
         return f"✅ Capped {n} player(s) to {fmt(amt)} total."
     if sub == "set":
-        if not tgt or len(rest) < 2 or not rest[1].isdigit() or (len(rest) > 2 and not rest[2].isdigit()):
+        if not tgt or len(rest) < 2:
+            return "❌ Usage: `/admin set @user <cash> [bank]`"
+        new_c = parse_amount(rest[1], MAX_COINS)
+        new_b = parse_amount(rest[2], MAX_COINS) if len(rest) > 2 else get(tgt)[1]
+        if new_c is None or new_b is None:
             return "❌ Usage: `/admin set @user <cash> [bank]`"
         snapshot([tgt])
-        set_money(tgt, int(rest[1]), int(rest[2]) if len(rest) > 2 else get(tgt)[1])
+        set_money(tgt, new_c, new_b)
         return f"✅ {tag(tgt)} now has {fmt(get(tgt)[0])} cash and {fmt(get(tgt)[1])} bank."
     if sub == "take":
         if not tgt or len(rest) < 2:
@@ -1756,7 +1787,7 @@ def admin_cmd(uid, args):
         change(tgt, cash=-from_cash, bank=-(amt - from_cash))
         return f"✅ Took {fmt(amt)} from {tag(tgt)}."
     if sub == "giveall":
-        amt = parse_amount(rest[0], 0) if rest else None
+        amt = parse_amount(rest[0], MAX_COINS) if rest else None
         if not amt:
             return "❌ Usage: `/admin giveall <amount>`"
         ids = all_uids()
@@ -1905,27 +1936,7 @@ def ecohelp(uid, args):
     return {"text": INTRO, "blocks": help_blocks(uid in ADMINS), "response_type": "ephemeral", "nolog": True}
 
 
-@app.event("app_mention")
-def on_mention(event, say):
-    # public reply (in a thread) so everyone sees the commands. Never includes admin commands.
-    print("Received app_mention:", event.get("user"), event.get("channel"), event.get("text"))
-    kwargs = {"text": INTRO, "blocks": help_blocks(False)}
-    thread = event.get("thread_ts") or event.get("ts")
-    if thread:
-        kwargs["thread_ts"] = thread
-    try:
-        say(**kwargs)
-    except Exception as e:
-        print("app_mention reply failed:", repr(e))
-        try:
-            say(text=INTRO, blocks=help_blocks(False))
-        except Exception as e2:
-            print("app_mention fallback failed:", repr(e2))
-
-
 def keep_alive_server():
-    """Tiny web page so hosts like Render (which want an open port) accept the bot.
-    Point UptimeRobot at the service URL so the free instance never sleeps."""
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     class H(BaseHTTPRequestHandler):
@@ -1947,7 +1958,7 @@ if __name__ == "__main__":
     if GH_TOKEN and GH_REPO:
         threading.Thread(target=backup_loop, daemon=True).start()
 
-        def on_stop(*_):  # host is restarting us: save right now
+        def on_stop(*_):
             backup_db()
             sys.exit(0)
         signal.signal(signal.SIGTERM, on_stop)
