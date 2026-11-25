@@ -1081,8 +1081,20 @@ def ecohelp(uid, args):
 
 @app.event("app_mention")
 def on_mention(event, say):
-    # public reply (in a thread) so everyone sees the pitch + commands
-    say(text=MENTION_TEXT + HELP_TEXT, thread_ts=event.get("thread_ts") or event.get("ts"))
+    print("Received app_mention:", event.get("user"), event.get("channel"), event.get("text"))
+    msg = MENTION_TEXT + HELP_TEXT
+    kwargs = {"text": msg}
+    thread = event.get("thread_ts") or event.get("ts")
+    if thread:
+        kwargs["thread_ts"] = thread
+    try:
+        say(**kwargs)
+    except Exception as e:
+        print("app_mention reply failed:", repr(e))
+        try:
+            say(text=msg)
+        except Exception as e2:
+            print("app_mention fallback reply failed:", repr(e2))
 
 
 def keep_alive_server():
