@@ -1,4 +1,5 @@
 import os, re, sys, time, random, sqlite3, threading, uuid, queue
+from decimal import Decimal, InvalidOperation
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.webhook import WebhookClient
@@ -11,15 +12,24 @@ if "SLACK_BOT_TOKEN" not in os.environ or "SLACK_APP_TOKEN" not in os.environ:
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 # Look up our own bot user ID so @Hakari works via BOTH app_mention AND message events
+BOT_NAME = "hakari"
 try:
-    BOT_UID = app.client.auth_test()["user_id"]
+    _auth = app.client.auth_test()
+    BOT_UID = _auth["user_id"]
+    BOT_NAME = (_auth.get("user") or _auth.get("bot_id") or BOT_NAME)
     print(f"Authenticated as bot user ID: {BOT_UID}")
 except Exception as e:
     BOT_UID = None
     print("auth_test failed:", repr(e))
 
+# "<@U12345>" or a plain "@hakari" both count as a mention
+MENTION_RE = re.compile(r"<@" + re.escape(BOT_UID) + r">", re.I) if BOT_UID else None
+
 ADMINS = {"U0C7S6T72DD"}  # Slack member IDs allowed to use admin commands (also hidden from /lb)
-MAX_COINS = 9_000_000_000_000_000_000  # stay safely under SQLite 64-bit signed int limit (9.22e18)
+# Hard ceiling for ONE player's total wealth (cash + bank). Balances are stored
+# as whole quintillions + remainder, so this is far above what SQLite's 64 bit
+# integer can hold on its own and the math never overflows.
+MAX_COINS = 10 ** 30
 
 # ---------- database ----------
 SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eco.db")  # a copy shipped in the code repo
@@ -162,20 +172,66 @@ def backup_loop():
 restore_db()
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 lock = threading.RLock()
-db.execute("CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY, cash INTEGER DEFAULT 100, bank INTEGER DEFAULT 0)")
+UNIT = 10 ** 18  # one quintillion: balances are stored as (units of 1 qi) + remainder
+db.execute("CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY, cash INTEGER DEFAULT 100, bank INTEGER DEFAULT 0, "
+           "cash_x INTEGER DEFAULT 0, bank_x INTEGER DEFAULT 0)")
 db.execute("CREATE TABLE IF NOT EXISTS cooldowns (uid TEXT, action TEXT, ts REAL, PRIMARY KEY (uid, action))")
 db.execute("CREATE TABLE IF NOT EXISTS items (name TEXT PRIMARY KEY, price INTEGER, description TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS inv (uid TEXT, name TEXT, amount INTEGER, PRIMARY KEY (uid, name))")
-db.execute("CREATE TABLE IF NOT EXISTS log (ts REAL, uid TEXT, cash INTEGER, bank INTEGER, why TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS log (ts REAL, uid TEXT, cash TEXT, bank TEXT, why TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, val TEXT)")
-db.execute("CREATE TABLE IF NOT EXISTS snap (uid TEXT PRIMARY KEY, cash INTEGER, bank INTEGER)")
-for col in ("name TEXT", "last_seen REAL"):
+db.execute("CREATE TABLE IF NOT EXISTS snap (uid TEXT PRIMARY KEY, cash TEXT, bank TEXT)")
+for col in ("name TEXT", "last_seen REAL", "cash_x INTEGER DEFAULT 0", "bank_x INTEGER DEFAULT 0"):
     try:
         db.execute(f"ALTER TABLE users ADD COLUMN {col}")
     except sqlite3.OperationalError:
         pass
-db.execute("UPDATE users SET last_seen=? WHERE last_seen IS NULL AND (cash+bank) > 100", (time.time(),))
-db.commit()
+
+
+def _text_cols(table):
+    """Old log/snap tables used INTEGER columns, which cannot hold huge sums.
+    Rebuild them with TEXT money columns so big balances stay exact."""
+    try:
+        cols = {r[1]: (r[2] or "").upper() for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.OperationalError:
+        return
+    if not cols:
+        return
+    if "cash" in cols and cols["cash"] != "TEXT":
+        new_cols = {c: ("TEXT" if c in ("cash", "bank") else t) for c, t in cols.items()}
+        db.execute(f"CREATE TABLE {table}_new ({', '.join(f'{c} {t}' for c, t in new_cols.items())})")
+        db.execute(f"INSERT INTO {table}_new SELECT {', '.join(cols)} FROM {table}")
+        db.execute(f"DROP TABLE {table}")
+        db.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+        print(f"migrated {table} to TEXT money columns")
+
+
+_text_cols("log")
+_text_cols("snap")
+
+
+def migrate_balances():
+    """Move every balance into the (huge part, remainder) columns, exactly."""
+    with lock:
+        rows = db.execute("SELECT uid, cash, bank, cash_x, bank_x FROM users").fetchall()
+        fixed = 0
+        for uid, c, b, cx, bx in rows:
+            tc = int(c or 0) + int(cx or 0) * UNIT
+            tb = int(b or 0) + int(bx or 0) * UNIT
+            units_c, rem_c = divmod(tc, UNIT)
+            units_b, rem_b = divmod(tb, UNIT)
+            if (rem_c, units_c, rem_b, units_b) != (int(c or 0), int(cx or 0), int(b or 0), int(bx or 0)):
+                db.execute("UPDATE users SET cash=?, cash_x=?, bank=?, bank_x=? WHERE uid=?",
+                           (rem_c, units_c, rem_b, units_b, uid))
+                fixed += 1
+        db.execute("UPDATE users SET last_seen=? WHERE last_seen IS NULL AND "
+                   "(cash > 100 OR bank > 100 OR cash_x > 0 OR bank_x > 0)", (time.time(),))
+        db.commit()
+    if fixed:
+        print(f"migrated {fixed} balance(s) to the big-number format")
+
+
+migrate_balances()
 
 COIN = os.environ.get("COIN", "🪙")
 COOLDOWNS = {"work": 60, "crime": 60, "rob": 120, "collect": 86400}
@@ -187,6 +243,15 @@ chat_last = {}
 ACTIVE_DAYS = 3
 LOG_CHANNEL = os.environ.get("LOG_CHANNEL", "gamblelogs")
 C_GREEN, C_RED, C_GOLD, C_BLUE, C_GREY = "#2ecc71", "#e74c3c", "#f1c40f", "#3498db", "#95a5a6"
+
+
+def to_int(v):
+    """Read a money value that may be stored as an integer or as text."""
+    if v is None:
+        return 0
+    if isinstance(v, int):
+        return v
+    return int(Decimal(str(v)))
 
 
 def clamp(n):
@@ -201,6 +266,12 @@ def signed(n):
     return f"{'+' if n >= 0 else '-'}{fmt(abs(n))}"
 
 
+def stars(total):
+    """One star per whole quintillion somebody owns (1 qi = 1 star)."""
+    n = int(total) // UNIT
+    return "⭐" * min(n, 9) if n > 0 else ""
+
+
 def ordinal(n):
     return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
@@ -209,20 +280,38 @@ def get(uid):
     with lock:
         db.execute("INSERT OR IGNORE INTO users (uid) VALUES (?)", (uid,))
         db.commit()
-        c, b = db.execute("SELECT cash, bank FROM users WHERE uid=?", (uid,)).fetchone()
-        return int(c or 0), int(b or 0)
+        row = db.execute("SELECT cash, bank, cash_x, bank_x FROM users WHERE uid=?", (uid,)).fetchone()
+    # cash/bank hold the remainder, cash_x/bank_x hold whole quintillions
+    c = int(row[0] or 0) + int(row[2] or 0) * UNIT
+    b = int(row[1] or 0) + int(row[3] or 0) * UNIT
+    return c, b
 
 
 def change(uid, cash=0, bank=0):
     cur_c, cur_b = get(uid)
-    new_c = clamp(cur_c + int(cash))
-    new_b = clamp(cur_b + int(bank))
+    new_c = cur_c + int(cash)
+    new_b = cur_b + int(bank)
+    # One account may never hold more than MAX_COINS in TOTAL (cash + bank).
+    # If it did, SQLite's integer math would overflow and every query on that
+    # account (leaderboard, stats, balance) would break.
+    if new_c + new_b > MAX_COINS:
+        over = new_c + new_b - MAX_COINS
+        take_c = min(max(new_c, 0), over)
+        new_c -= take_c
+        over -= take_c
+        if over > 0:
+            new_b -= over
+    new_c = max(-MAX_COINS, min(MAX_COINS, new_c))
+    new_b = max(-MAX_COINS, min(MAX_COINS, new_b))
     dc = new_c - cur_c
     db_delta = new_b - cur_b
     why = sys._getframe(1).f_code.co_name
+    units_c, rem_c = divmod(new_c, UNIT)   # whole quintillions + remainder
+    units_b, rem_b = divmod(new_b, UNIT)
     with lock:
-        db.execute("UPDATE users SET cash=?, bank=? WHERE uid=?", (new_c, new_b, uid))
-        db.execute("INSERT INTO log VALUES (?,?,?,?,?)", (time.time(), uid, dc, db_delta, why))
+        db.execute("UPDATE users SET cash=?, cash_x=?, bank=?, bank_x=? WHERE uid=?",
+                   (rem_c, units_c, rem_b, units_b, uid))
+        db.execute("INSERT INTO log VALUES (?,?,?,?,?)", (time.time(), uid, str(dc), str(db_delta), why))
         if random.random() < 0.01:
             db.execute("DELETE FROM log WHERE ts < ?", (time.time() - 7 * 86400,))
         db.commit()
@@ -343,13 +432,40 @@ def wire(d):
     return d
 
 
+def plain_text(view):
+    """Fallback text for a message payload (Slack wants some text next to attachments)."""
+    for att in (view.get("attachments") or []):
+        for b in att.get("blocks") or []:
+            t = (b.get("text") or {}).get("text")
+            if t:
+                return re.sub(r"[*_`]", "", t)[:300]
+    return ""
+
+
 def swap(respond, view):
+    # replace_original goes through the response_url, which only accepts a small
+    # set of keys. "nolog"/"response_type" are not valid there -> drop them,
+    # otherwise Slack rejects the update and the button does nothing.
     v = wire(render(view, False))
+    v.pop("nolog", None)
+    v.pop("response_type", None)
+    if not v.get("text"):
+        v["text"] = plain_text(v)
     respond(replace_original=True, **v)
 
 
-def only_you(respond, text):
-    respond(text=text, replace_original=False, response_type="ephemeral")
+def only_you(client, respond, body, text):
+    """Reply to a button click so that only the person who clicked sees it."""
+    channel = (body.get("channel") or {}).get("id")
+    user = body["user"]["id"]
+    try:
+        client.chat_postEphemeral(channel=channel, user=user, text=text)
+    except Exception as e:
+        print("ephemeral reply failed:", repr(e))
+        try:
+            respond(text=text)
+        except Exception as e2:
+            print("reply failed:", repr(e2))
 
 
 # ---------- #gamblelogs ----------
@@ -424,18 +540,25 @@ def game_gate(uid):
     return None
 
 
+MULTS = {"": 1, "k": 10 ** 3, "m": 10 ** 6, "b": 10 ** 9,
+         "t": 10 ** 12, "q": 10 ** 15, "qi": 10 ** 18, "z": 10 ** 21, "y": 10 ** 24}
+
+
 def parse_amount(text, maximum):
     t = text.replace(",", "").lower()
     if t == "all":
         return maximum
     if t == "half":
         return maximum // 2
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmbtq]?)", t)
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(qi|[kmbtqzy])?", t)
     if not m:
         return None
-    mults = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000,
-             "t": 1_000_000_000_000, "q": 1_000_000_000_000_000}
-    return clamp(int(float(m.group(1)) * mults[m.group(2)]))
+    try:
+        # Decimal instead of float: "9qi" must stay exactly 9_000_000_000_000_000_000
+        val = Decimal(m.group(1)) * MULTS[m.group(2) or ""]
+    except (InvalidOperation, ValueError):
+        return None
+    return clamp(int(val))
 
 
 def parse_user(text):
@@ -447,7 +570,8 @@ def check_bet(uid, args, game):
     cash, _ = get(uid)
     bet = parse_amount(args[0], cash) if args else None
     if not bet or bet <= 0 or bet > cash:
-        return None, f"❌ Invalid bet. You have {fmt(cash)} cash. (use a number, `5k`, `half` or `all`)"
+        return None, (f"❌ Invalid bet. You have {fmt(cash)} cash. "
+                      "(use a number, `5k`, `9qi`, `half` or `all`)")
     gate = game_gate(uid)
     if gate:
         return None, gate
@@ -540,11 +664,16 @@ def cmd(name, keep_case=False):
 
 
 @app.action("show_help")
-def show_help(ack, body, respond):
+def show_help(ack, body, respond, client):
     ack()
     uid = body["user"]["id"]
-    respond(text="Hakari commands", blocks=help_blocks(uid in ADMINS), replace_original=False,
-            response_type="ephemeral")
+    channel = (body.get("channel") or {}).get("id")
+    try:
+        client.chat_postEphemeral(channel=channel, user=uid, text="Hakari commands",
+                                  blocks=help_blocks(uid in ADMINS))
+    except Exception as e:
+        print("help reply failed:", repr(e))
+        respond(text="Hakari commands", blocks=help_blocks(uid in ADMINS))
 
 
 reminders = set()
@@ -556,10 +685,10 @@ def remind(ack, body, respond, client, action):
     uid, act = body["user"]["id"], action["value"]
     left = cooldown_left(uid, act, start=False) if act in COOLDOWNS else 0
     if not left:
-        only_you(respond, f"✅ `/{act}` is ready right now!")
+        only_you(client, respond, body, f"✅ `/{act}` is ready right now!")
         return
     if (uid, act) in reminders:
-        only_you(respond, "⏱ You already have a reminder set for that.")
+        only_you(client, respond, body, "⏱ You already have a reminder set for that.")
         return
     reminders.add((uid, act))
     channel = (body.get("channel") or {}).get("id")
@@ -577,7 +706,7 @@ def remind(ack, body, respond, client, action):
     t = threading.Timer(left, fire)
     t.daemon = True
     t.start()
-    only_you(respond, f"⏱ I'll remind you in {left // 60}m {left % 60}s." if left >= 60 else f"⏱ I'll remind you in {left}s.")
+    only_you(client, respond, body, f"⏱ I'll remind you in {left // 60}m {left % 60}s." if left >= 60 else f"⏱ I'll remind you in {left}s.")
 
 
 # ---------- balance & money ----------
@@ -588,7 +717,8 @@ def balance(uid, args):
         return "❌ Usage: `/bank [@user]`"
     cash, bank = get(target)
     return embed(f"💰 *{tag(target)}'s balance*", C_BLUE, nolog=True,
-                 fields=[f"*Cash*\n{fmt(cash)}", f"*Bank*\n{fmt(bank)}", f"*Net worth*\n{fmt(cash + bank)}"],
+                 fields=[f"*Cash*\n{fmt(cash)}", f"*Bank*\n{fmt(bank)}",
+                         f"*Net worth*\n{fmt(cash + bank)} {stars(cash + bank)}"],
                  footer="Cash can be robbed. Bank money is safe: /deposit it!")
 
 
@@ -633,16 +763,24 @@ def lb_view(uid, page):
     with lock:
         adm = list(ADMINS)
         marks = ",".join("?" * len(adm))
-        total = db.execute(f"SELECT COUNT(*) FROM users WHERE cash+bank > 0 AND uid NOT IN ({marks})", adm).fetchone()[0]
-        pages = max(1, -(-total // LB_SIZE))
-        page = max(1, min(page, pages))
-        rows = db.execute(f"SELECT uid, cash+bank AS t FROM users WHERE cash+bank > 0 AND uid NOT IN ({marks}) "
-                          f"ORDER BY t DESC, uid LIMIT ? OFFSET ?", adm + [LB_SIZE, (page - 1) * LB_SIZE]).fetchall()
-        mine = sum(get(uid))
-        rank = db.execute(f"SELECT COUNT(*) FROM users WHERE uid NOT IN ({marks}) AND cash+bank > ?", adm + [mine]).fetchone()[0] + 1
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        # Totals are added up in Python: cash+bank inside SQLite overflows on
+        # very large accounts and turns into a float, which wrecks the order.
+        raw = db.execute(f"SELECT uid, cash, bank, cash_x, bank_x FROM users WHERE uid NOT IN ({marks})", adm).fetchall()
+    totals = []
+    for u, c, b, cx, bx in raw:
+        t = int(c or 0) + int(b or 0) + (int(cx or 0) + int(bx or 0)) * UNIT
+        if t > 0:
+            totals.append((u, t))
+    totals.sort(key=lambda r: (-r[1], r[0]))
+    total = len(totals)
+    pages = max(1, -(-total // LB_SIZE))
+    page = max(1, min(page, pages))
     start = (page - 1) * LB_SIZE
-    lines = "\n".join(f"{medals.get(start + i, f'`{start + i}.`')} {tag(u)} • {fmt(t)}"
+    rows = totals[start:start + LB_SIZE]
+    mine = sum(get(uid))
+    rank = sum(1 for _, t in totals if t > mine) + 1
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = "\n".join(f"{medals.get(start + i, f'`{start + i}.`')} {tag(u)} {stars(t)}• {fmt(t)}"
                       for i, (u, t) in enumerate(rows, 1))
     buttons = []
     if page > 1:
@@ -650,8 +788,9 @@ def lb_view(uid, page):
     if page < pages:
         buttons.append(btn("Next ▶", "lb_page", f"{uid}:{page + 1}", "primary"))
     return embed(f"🏆 *Leaderboard*\n{lines or 'Nobody here yet.'}", C_GOLD, nolog=True, buttons=buttons or None,
-                 footer=f"Page {page}/{pages} · " + (f"You're an admin, so you're hidden from the leaderboard · {fmt(mine)}" if uid in ADMINS
-                                                  else f"Your leaderboard rank: {ordinal(rank)} · {fmt(mine)}"))
+                 footer=f"Page {page}/{pages} · " + (f"You're an admin, so you're hidden from the leaderboard · {fmt(mine)}"
+                                                  if uid in ADMINS
+                                                  else f"Your leaderboard rank: {ordinal(rank)} · {fmt(mine)} {stars(mine)}"))
 
 
 @cmd("leaderboard")
@@ -670,9 +809,9 @@ def lb_page(ack, body, respond, action):
 @cmd("stats")
 def stats(uid, args):
     with lock:
-        rows = db.execute("SELECT cash, bank FROM users").fetchall()
-    cash = sum(int(c or 0) for c, _ in rows)
-    bank = sum(int(b or 0) for _, b in rows)
+        rows = db.execute("SELECT cash, bank, cash_x, bank_x FROM users").fetchall()
+    cash = sum(int(c or 0) + int(cx or 0) * UNIT for c, _, cx, _ in rows)
+    bank = sum(int(b or 0) + int(bx or 0) * UNIT for _, b, _, bx in rows)
     return (f"*📊 Economy stats*\nPlayers: {len(rows):,}\nTotal cash: {fmt(cash)}\n"
             f"Total bank: {fmt(bank)}\nTotal: {fmt(cash + bank)}")
 
@@ -761,7 +900,17 @@ def collect(uid, args):
 mention_seen = {}  # event_ts -> timestamp (prevents double-reply if both app_mention and message fire)
 
 
-def post_commands_mention(event, say):
+def is_mention(text):
+    """True if the message mentions the bot (by id or by name)."""
+    text = text or ""
+    if BOT_UID and f"<@{BOT_UID}>" in text:
+        return True
+    if MENTION_RE is not None and MENTION_RE.search(text):
+        return True
+    return bool(BOT_NAME) and re.search(r"@" + re.escape(BOT_NAME) + r"\b", text, re.I) is not None
+
+
+def post_commands_mention(event, say, client=None):
     ev_id = event.get("client_msg_id") or event.get("ts")
     now = time.time()
     # prune old entries
@@ -774,27 +923,37 @@ def post_commands_mention(event, say):
         mention_seen[ev_id] = now
 
     print("Replying to @Hakari mention from:", event.get("user"), "in channel:", event.get("channel"))
-    kwargs = {"text": INTRO, "blocks": help_blocks(False)}
+    blocks = help_blocks(False)
+    kwargs = {"text": INTRO, "blocks": blocks}
     thread = event.get("thread_ts") or event.get("ts")
     if thread:
         kwargs["thread_ts"] = thread
     try:
         say(**kwargs)
+        return
     except Exception as e:
         print("app_mention thread reply failed, trying channel root:", repr(e))
+    try:
+        say(text=INTRO, blocks=blocks)
+        return
+    except Exception as e2:
+        print("app_mention channel reply failed, trying ephemeral:", repr(e2))
+    # last resort: DM the command list to whoever pinged us
+    if client is not None:
         try:
-            say(text=INTRO, blocks=help_blocks(False))
-        except Exception as e2:
-            print("app_mention reply completely failed:", repr(e2))
+            client.chat_postEphemeral(channel=event.get("channel"), user=event.get("user"),
+                                      text=INTRO + "\n" + PLAIN_COMMANDS)
+        except Exception as e3:
+            print("app_mention reply completely failed:", repr(e3))
 
 
 @app.event("app_mention")
-def on_mention(event, say):
-    post_commands_mention(event, say)
+def on_mention(event, say, client):
+    post_commands_mention(event, say, client)
 
 
 @app.event("message")
-def on_message(event, say):
+def on_message(event, say, client):
     # ignore bots, edits, joins, etc.
     if event.get("subtype") or event.get("bot_id"):
         return
@@ -804,8 +963,8 @@ def on_message(event, say):
         return
 
     # If someone mentions @Hakari anywhere in a message (including line 2), reply with commands!
-    if BOT_UID and f"<@{BOT_UID}>" in text:
-        post_commands_mention(event, say)
+    if is_mention(text):
+        post_commands_mention(event, say, client)
         return
 
     if event.get("channel_type") == "im" or len(text) < 3:
@@ -951,15 +1110,15 @@ def blackjack(uid, args):
 
 
 @app.action(re.compile(r"^bj_(hit|stand|double)$"))
-def bj_action(ack, body, respond, action):
+def bj_action(ack, body, respond, client, action):
     ack()
     with lock:
         g = games.get(action["value"])
         if not g:
-            only_you(respond, "That game has ended.")
+            only_you(client, respond, body, "That game has ended.")
             return
         if body["user"]["id"] != g["uid"]:
-            only_you(respond, "❌ This isn't your game!")
+            only_you(client, respond, body, "❌ This isn't your game!")
             return
         kind = action["action_id"]
         if kind == "bj_hit":
@@ -969,7 +1128,7 @@ def bj_action(ack, body, respond, action):
                 return
         elif kind == "bj_double":
             if len(g["p"]) != 2 or get(g["uid"])[0] < g["bet"]:
-                only_you(respond, "❌ You can't double down now.")
+                only_you(client, respond, body, "❌ You can't double down now.")
                 return
             change(g["uid"], cash=-g["bet"])
             g["bet"] *= 2
@@ -984,17 +1143,17 @@ def again_dispatch(kind, uid, bet_text):
 
 
 @app.action(re.compile(r"^(bj|slots|hl|rr)_again$"))
-def again_action(ack, body, respond, action):
+def again_action(ack, body, respond, client, action):
     ack()
     kind = action["action_id"].split("_")[0]
     uid, bet = action["value"].split(":")
     with lock:
         if body["user"]["id"] != uid:
-            only_you(respond, "❌ This isn't your game!")
+            only_you(client, respond, body, "❌ This isn't your game!")
             return
         v = again_dispatch(kind, uid, bet)
         if isinstance(v, str):
-            only_you(respond, v)
+            only_you(client, respond, body, v)
         else:
             swap(respond, v)
 
@@ -1071,16 +1230,16 @@ def higher_lower(uid, args):
 
 
 @app.action(re.compile(r"^hl_(higher|lower)$"))
-def hl_action(ack, body, respond, action):
+def hl_action(ack, body, respond, client, action):
     ack()
     with lock:
         g = hl_games.get(action["value"])
         if not g:
-            only_you(respond, "That game has ended.")
+            only_you(client, respond, body, "That game has ended.")
             return
         uid, bet = g["uid"], g["bet"]
         if body["user"]["id"] != uid:
-            only_you(respond, "❌ This isn't your game!")
+            only_you(client, respond, body, "❌ This isn't your game!")
             return
         hl_games.pop(g["gid"])
         c = g["card"]
@@ -1147,15 +1306,15 @@ def rps(uid, args):
 
 
 @app.action(re.compile(r"^rps_(rock|paper|scissors)$"))
-def rps_action(ack, body, respond, action):
+def rps_action(ack, body, respond, client, action):
     ack()
     with lock:
         g = rps_games.get(action["value"])
         if not g:
-            only_you(respond, "That game has ended.")
+            only_you(client, respond, body, "That game has ended.")
             return
         if body["user"]["id"] != g["uid"]:
-            only_you(respond, "❌ This isn't your game!")
+            only_you(client, respond, body, "❌ This isn't your game!")
             return
         me = action["action_id"][4:]
         bot_move = random.choice(list(RPS))
@@ -1350,23 +1509,23 @@ def replace(respond, text, extra_blocks=None):
 
 
 @app.action(re.compile(r"^ch_(accept|decline)$"))
-def ch_action(ack, body, respond, action):
+def ch_action(ack, body, respond, client, action):
     ack()
     with lock:
         gid, user = action["value"], body["user"]["id"]
         c = challenges.get(gid)
         if not c:
-            only_you(respond, "That challenge expired.")
+            only_you(client, respond, body, "That challenge expired.")
             return
         if action["action_id"] == "ch_decline":
             if user not in (c["a"], c["b"]):
-                only_you(respond, "❌ This challenge isn't for you!")
+                only_you(client, respond, body, "❌ This challenge isn't for you!")
                 return
             challenges.pop(gid)
             replace(respond, f"❌ {tag(user)} cancelled the {GAME_NAMES[c['kind']]} challenge.")
             return
         if user != c["b"]:
-            only_you(respond, "❌ This challenge isn't for you!")
+            only_you(client, respond, body, "❌ This challenge isn't for you!")
             return
         bet = c["bet"]
         if get(c["a"])[0] < bet or get(c["b"])[0] < bet:
@@ -1409,19 +1568,19 @@ def rps_view(g):
 
 
 @app.action(re.compile(r"^prps_(rock|paper|scissors)$"))
-def prps_action(ack, body, respond, action):
+def prps_action(ack, body, respond, client, action):
     ack()
     with lock:
         g = pvp.get(action["value"])
         user = body["user"]["id"]
         if not g:
-            only_you(respond, "That game has ended.")
+            only_you(client, respond, body, "That game has ended.")
             return
         if user not in (g["a"], g["b"]):
-            only_you(respond, "❌ This isn't your game!")
+            only_you(client, respond, body, "❌ This isn't your game!")
             return
         if user in g["picks"]:
-            only_you(respond, "You already picked, waiting for your opponent.")
+            only_you(client, respond, body, "You already picked, waiting for your opponent.")
             return
         move = action["action_id"][5:]
         g["picks"][user] = move
@@ -1429,7 +1588,7 @@ def prps_action(ack, body, respond, action):
         if len(g["picks"]) < 2:
             arm(g)
             respond(replace_original=True, **render(rps_view(g), False))
-            only_you(respond, f"You picked {RPS[move]} {move}. Waiting for your opponent...")
+            only_you(client, respond, body, f"You picked {RPS[move]} {move}. Waiting for your opponent...")
             return
         a, b, bet = g["a"], g["b"], g["bet"]
         pa, pb = g["picks"][a], g["picks"][b]
@@ -1480,25 +1639,25 @@ def bj2_result(g):
 
 
 @app.action(re.compile(r"^pbj_(hit|stand|hand)$"))
-def pbj_action(ack, body, respond, action):
+def pbj_action(ack, body, respond, client, action):
     ack()
     with lock:
         g = pvp.get(action["value"])
         user = body["user"]["id"]
         if not g:
-            only_you(respond, "That game has ended.")
+            only_you(client, respond, body, "That game has ended.")
             return
         if user not in (g["a"], g["b"]):
-            only_you(respond, "❌ This isn't your game!")
+            only_you(client, respond, body, "❌ This isn't your game!")
             return
         h = g["h"][user]
         kind = action["action_id"][4:]
         mine = lambda: f"Your hand: {show(h)} = *{hand_val(h)}*"
         if kind == "hand":
-            only_you(respond, mine())
+            only_you(client, respond, body, mine())
             return
         if user in g["done"]:
-            only_you(respond, f"You're done, waiting for your opponent.\n{mine()}")
+            only_you(client, respond, body, f"You're done, waiting for your opponent.\n{mine()}")
             return
         g["url"] = body.get("response_url") or g["url"]
         if kind == "hit":
@@ -1516,7 +1675,7 @@ def pbj_action(ack, body, respond, action):
             return
         arm(g)
         respond(replace_original=True, **render(bj2_view(g), False))
-        only_you(respond, mine())
+        only_you(client, respond, body, mine())
 
 
 # --- tic tac toe ---
@@ -1554,24 +1713,28 @@ def ttt(uid, args):
 
 
 @app.action("ttt_pick")
-def ttt_action(ack, body, respond, action):
+def ttt_action(ack, body, respond, client, action):
     ack()
     with lock:
-        gid, idx = action["selected_option"]["value"].split(":")
+        pick = action.get("selected_option") or {}
+        if not pick.get("value"):
+            only_you(client, respond, body, "❌ Pick a square (1-9).")
+            return
+        gid, idx = pick["value"].split(":")
         g = pvp.get(gid)
         user = body["user"]["id"]
         if not g:
-            only_you(respond, "That game has ended.")
+            only_you(client, respond, body, "That game has ended.")
             return
         if user not in (g["a"], g["b"]):
-            only_you(respond, "❌ This isn't your game!")
+            only_you(client, respond, body, "❌ This isn't your game!")
             return
         if user != g["turn"]:
-            only_you(respond, "❌ It's not your turn!")
+            only_you(client, respond, body, "❌ It's not your turn!")
             return
         i = int(idx)
         if g["board"][i]:
-            only_you(respond, "❌ That square is taken.")
+            only_you(client, respond, body, "❌ That square is taken.")
             return
         mark = "X" if user == g["a"] else "O"
         g["board"][i] = mark
@@ -1711,7 +1874,7 @@ def snapshot(uids):
         db.execute("DELETE FROM snap")
         for u in uids:
             c, b = get(u)
-            db.execute("INSERT INTO snap VALUES (?,?,?)", (u, c, b))
+            db.execute("INSERT INTO snap VALUES (?,?,?)", (u, str(c), str(b)))
         db.commit()
 
 
@@ -1802,7 +1965,7 @@ def admin_cmd(uid, args):
         if not rows:
             return "❌ Nothing to undo."
         for u, c, b in rows:
-            set_money(u, int(c), int(b))
+            set_money(u, to_int(c), to_int(b))
         return f"↩️ Restored {len(rows)} player(s) to how they were before the last change."
     if sub == "resetcd":
         with lock:
@@ -1865,13 +2028,22 @@ def audit(uid, args):
                           (target,)).fetchall()
     if not rows:
         return "No logged money moves for that user yet."
-    lines = [f"`{time.strftime('%d %H:%M:%S', time.gmtime(t))}` cash {int(c):+,} bank {int(b):+,} ({w})"
+    lines = [f"`{time.strftime('%d %H:%M:%S', time.gmtime(t))}` cash {to_int(c):+,} bank {to_int(b):+,} ({w})"
              for t, c, b, w in rows]
     return f"*Last moves (UTC)* for {tag(target)}\n" + "\n".join(lines)
 
 
 # ---------- help (also posted when someone @mentions the bot) ----------
-INTRO = "Yo, this is my gambling bot, check out commands:"
+INTRO = ("Yo, this is my gambling bot. Type `/` in the chat box to see every command, "
+         "or `/ecohelp` to get this list again:")
+
+PLAIN_COMMANDS = (
+    "/balance · /bank · /deposit · /withdraw · /give · /leaderboard · /lb · /stats · "
+    "/work · /crime · /rob · /collect · /blackjack · /bj · /slots · /higher-lower · "
+    "/russian-roulette · /rps · /roulette · /ttt · /roll · /catalog · /buy · /inventory · "
+    "/use · /ecohelp · /add-money · /create-item · /delete-item · /audit · "
+    "/set-blackjack-decks · /set-game-cooldown · /admin"
+)
 
 
 def help_blocks(admin=False):
@@ -1917,10 +2089,11 @@ def help_blocks(admin=False):
         "`/catalog [item]` – items for sale. `/buy <item> [amount]` · `/inventory` · `/use <item> [amount]`",
 
         f"*ℹ️ Good to know*\n"
-        f"Bets accept numbers, `5k`, `half` or `all`. There are no bet limits. "
+        f"Bets accept numbers, `5k`, `half` or `all`. Amounts also accept suffixes: "
+        "`k` `m` `b` `t` `q` `qi` `z` `y` (so `9qi` = 9,000,000,000,000,000,000). There are no bet limits. "
         "Payouts shrink a little when you're very rich (over 100k) so nobody snowballs forever. "
         "Money and solo-game commands are only visible to you; rob, give, roulette and challenges are public.\n"
-        "🏆 Top the `/lb` and you can win prizes too!",
+        "🏆 Top the `/lb` and you can win prizes too! ⭐ = one star per quintillion you hold.",
     ]
     if admin:
         parts.append("*🛠 Admin (only you can see this)*\n"
@@ -1928,6 +2101,7 @@ def help_blocks(admin=False):
                      "`/add-money @user <amount>` · `/create-item <name> <price> <description>` · `/delete-item <name>` · `/audit @user`\n"
                      "`/set-blackjack-decks <1-8>` · "
                      "`/set-game-cooldown <usages> <duration>` (e.g. `4 5m`)")
+    parts.append(f"*📋 All commands*\n{PLAIN_COMMANDS}")
     return [section(INTRO)] + [section(p) for p in parts]
 
 
