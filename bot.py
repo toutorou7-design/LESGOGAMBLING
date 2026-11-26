@@ -943,13 +943,12 @@ def lb_view(uid, page):
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines = "\n".join(f"{medals.get(start + i, f'`{start + i}.`')} {tag(u)} {stars(t)}• {fmt(t)}"
                       for i, (u, t) in enumerate(rows, 1))
-    buttons = []
-    if page > 1:
-        buttons.append(btn("◀ Prev", "lb_page", f"{uid}:{page - 1}"))
-    if page < pages:
-        buttons.append(btn("Next ▶", "lb_page", f"{uid}:{page + 1}", "primary"))
-    return embed(f"🏆 *Leaderboard*\n{lines or 'Nobody here yet.'}", C_GOLD, nolog=True, buttons=buttons or None,
-                 footer=f"Page {page}/{pages} · " + (f"You're an admin, so you're hidden from the leaderboard · {fmt(mine)}"
+    # No buttons here on purpose: the old "Next ▶" button was dead in Slack
+    # (it fired but never changed the message). Paging is done with the
+    # command instead: /leaderboard 2, /leaderboard 3, ...
+    more = f" · more: `/leaderboard {page + 1}`" if page < pages else ""
+    return embed(f"🏆 *Leaderboard*\n{lines or 'Nobody here yet.'}", C_GOLD, nolog=True,
+                 footer=f"Page {page}/{pages}{more} · " + (f"You're an admin, so you're hidden from the leaderboard · {fmt(mine)}"
                                                   if uid in ADMINS
                                                   else f"Your leaderboard rank: {ordinal(rank)} · {fmt(mine)} {stars(mine)}"))
 
@@ -958,47 +957,6 @@ def lb_view(uid, page):
 def leaderboard(uid, args):
     page = int(args[0]) if args and args[0].isdigit() else 1
     return lb_view(uid, page)
-
-
-def post_page(client, body, view):
-    """Show a leaderboard page as its own message.
-
-    Updating the old message in place works only sometimes (Slack quietly
-    refuses to replace some ephemeral messages), and when it is refused the
-    button looks completely dead. Posting the page as a fresh ephemeral
-    message always works.
-    """
-    if client is None or body is None:
-        return False
-    v = wire(render(view, False))
-    v.pop("nolog", None)
-    v.pop("response_type", None)
-    if not v.get("text"):
-        v["text"] = plain_text(v)
-    try:
-        client.chat_postEphemeral(channel=(body.get("channel") or {}).get("id"),
-                                  user=body["user"]["id"],
-                                  text=v.get("text", ""),
-                                  attachments=v.get("attachments"))
-        return True
-    except Exception as e:
-        print("could not post the new page:", repr(e))
-        return False
-
-
-@app.action("lb_page")
-def lb_page(ack, body, respond, client, action):
-    ack()
-    try:
-        _, page = (action.get("value") or ":1").split(":")[:2]
-        view = lb_view(body["user"]["id"], int(page))
-    except Exception as e:
-        print("leaderboard page failed:", repr(e))
-        return
-    if post_page(client, body, view):
-        return
-    # last resort: replace the old message in place
-    swap(respond, view, client, body)
 
 
 @cmd("stats")
@@ -2270,7 +2228,7 @@ def help_blocks(admin=False):
         "`/deposit <amount|half|all>` – move cash into your bank so nobody can rob it.\n"
         "`/withdraw <amount|half|all>` – take money out of the bank.\n"
         "`/give @user <amount>` – send cash to someone. They get pinged.\n"
-        "`/leaderboard` – the richest players, 10 per page, and your own rank.\n"
+        "`/leaderboard [page]` – the richest players, 10 per page (`/leaderboard 2` for the next page), and your own rank.\n"
         "`/stats` – how many coins exist in total.",
 
         "*⛏️ Earn coins*\n"
