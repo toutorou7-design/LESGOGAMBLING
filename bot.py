@@ -26,6 +26,12 @@ except Exception as e:
 MENTION_RE = re.compile(r"<@" + re.escape(BOT_UID) + r">", re.I) if BOT_UID else None
 
 ADMINS = {"U0C7S6T72DD"}  # Slack member IDs allowed to use admin commands (also hidden from /lb)
+# Extra admins without touching the code: ADMIN_IDS="U123,U456" in the env.
+for _a in (os.environ.get("ADMIN_IDS") or "").replace(";", ",").split(","):
+    _a = _a.strip()
+    if _a:
+        ADMINS.add(_a)
+print(f"Admin IDs: {', '.join(sorted(ADMINS))}")
 # Hard ceiling for ONE player's total wealth (cash + bank). Balances are stored
 # as whole quintillions + remainder, so this is far above what SQLite's 64 bit
 # integer can hold on its own and the math never overflows.
@@ -272,6 +278,60 @@ def stars(total):
     return "⭐" * min(n, 9) if n > 0 else ""
 
 
+# ---------- gifs ----------
+GIF_JACKPOT = ("https://giphy.com/gifs/jjk-jackpot-hakari-dance-DbH6HUoJMrPdHCI6Ce",
+               "https://media.giphy.com/media/DbH6HUoJMrPdHCI6Ce/giphy.gif")
+GIF_REPLY = ("https://giphy.com/gifs/jujutsu-kaisen-jjk-tybwaizen-ocBtGFDsOjlcp6aItx",
+             "https://media.giphy.com/media/ocBtGFDsOjlcp6aItx/giphy.gif")
+GIF_LOSS = ("https://giphy.com/gifs/pirate-token-fort-yIeBW3pl4TnTTyqQsj",
+            "https://media.giphy.com/media/yIeBW3pl4TnTTyqQsj/giphy.gif")
+GIF_AMOUNT = 200_000  # a win or loss has to be at least this big for a gif
+
+
+def play_gif(client, channel, gif, caption=None, thread_ts=None):
+    """Post a gif in a channel as an inline animation (with a link as fallback)."""
+    if client is None or not channel:
+        return False
+    page, media = gif
+    blocks = []
+    if caption:
+        blocks.append(section(caption))
+    blocks.append({"type": "video", "video_url": media, "alt_text": caption or "gif",
+                   "title": {"type": "plain_text", "text": caption or "gif"},
+                   "thumbnail_url": media})
+    try:
+        client.chat_postMessage(channel=channel, text=f"{caption}\n{page}" if caption else page,
+                                blocks=blocks, thread_ts=thread_ts)
+        return True
+    except Exception as e:
+        print("gif could not be posted:", repr(e))
+        try:
+            client.chat_postMessage(channel=channel, text=f"{caption}\n{page}" if caption else page,
+                                    thread_ts=thread_ts)
+            return True
+        except Exception as e2:
+            print("gif fallback failed:", repr(e2))
+            return False
+
+
+def celebrate(uid, profit):
+    """Jackpot gif for a big win, sorry gif for a big loss."""
+    try:
+        profit = int(profit)
+    except (TypeError, ValueError):
+        return
+    if abs(profit) < GIF_AMOUNT:
+        return
+    client = getattr(cur, "client", None)
+    channel = getattr(cur, "channel", None)
+    if profit > 0:
+        play_gif(client, channel, GIF_JACKPOT,
+                 render(f"🎉 {tag(uid)} just won {fmt(profit)}!", False))
+    else:
+        play_gif(client, channel, GIF_LOSS,
+                 render(f"💀 {tag(uid)} just lost {fmt(abs(profit))}.", False))
+
+
 def ordinal(n):
     return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
@@ -356,6 +416,14 @@ name_cache = {}
 def name_of(uid):
     if uid in name_cache:
         return name_cache[uid]
+    # Fast path: the name we already stored when the player used a command.
+    # Asking Slack for every name is slow (and fails when users:read is
+    # missing), which made the leaderboard buttons time out.
+    with lock:
+        row = db.execute("SELECT name FROM users WHERE uid=?", (uid,)).fetchone()
+    if row and row[0]:
+        name_cache[uid] = row[0]
+        return row[0]
     try:
         info = app.client.users_info(user=uid)["user"]
         p = info.get("profile", {})
@@ -442,7 +510,23 @@ def plain_text(view):
     return ""
 
 
-def swap(respond, view):
+def reply_ok(res):
+    """Did Slack actually accept the message we sent?"""
+    if res is None:
+        return False
+    status = getattr(res, "status_code", 200)
+    body = getattr(res, "body", "")
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "ignore")
+    body = str(body).strip().lower()
+    if status != 200:
+        return False
+    if body in ("", "ok"):
+        return True
+    return '"ok": true' in body.replace("'", '"')
+
+
+def swap(respond, view, client=None, body=None):
     # replace_original goes through the response_url, which only accepts a small
     # set of keys. "nolog"/"response_type" are not valid there -> drop them,
     # otherwise Slack rejects the update and the button does nothing.
@@ -451,7 +535,28 @@ def swap(respond, view):
     v.pop("response_type", None)
     if not v.get("text"):
         v["text"] = plain_text(v)
-    respond(replace_original=True, **v)
+    try:
+        res = respond(replace_original=True, **v)
+    except Exception as e:
+        print("button update failed:", repr(e))
+        res = None
+    if reply_ok(res):
+        return True
+    # Slack refused the update (expired response_url, message gone, ...):
+    # show the new page as a fresh ephemeral message instead of doing nothing.
+    print("button update was rejected by Slack, posting it as a new message")
+    if client is not None and body is not None:
+        try:
+            client.chat_postEphemeral(
+                channel=(body.get("channel") or {}).get("id"),
+                user=body["user"]["id"],
+                text=v.get("text", ""),
+                attachments=v.get("attachments"))
+        except Exception as e:
+            print("fallback message failed:", repr(e))
+            return False
+        return True
+    return False
 
 
 def only_you(client, respond, body, text):
@@ -617,9 +722,16 @@ NOLOG = {"ecohelp", "audit"}
 cur = threading.local()
 
 
+def set_ctx(client, body=None):
+    """Remember where we are, so gifs and messages know where to go."""
+    cur.client = client
+    if body is not None:
+        cur.channel = (body.get("channel") or {}).get("id")
+
+
 def cmd(name, keep_case=False):
     def deco(fn):
-        def handler(ack, respond, command):
+        def handler(ack, respond, command, client):
             ack()
             cname = ALIAS.get(command["command"].lstrip("/"), name)
             uid = command["user_id"]
@@ -632,6 +744,7 @@ def cmd(name, keep_case=False):
                     set_name(m.group(1), m.group(2))
             args = tokens if keep_case else [t if t.startswith("<") else t.lower() for t in tokens]
             cur.channel, cur.url = command.get("channel_id"), command.get("response_url")
+            cur.client = client
             if uid not in ADMINS and setting(f"ban:{uid}", 0):
                 respond("🔒 You're blocked from the economy.", response_type="ephemeral")
                 return
@@ -802,10 +915,10 @@ def leaderboard(uid, args):
 
 
 @app.action("lb_page")
-def lb_page(ack, body, respond, action):
+def lb_page(ack, body, respond, client, action):
     ack()
     uid, page = action["value"].split(":")
-    swap(respond, lb_view(body["user"]["id"], int(page)))
+    swap(respond, lb_view(body["user"]["id"], int(page)), client, body)
 
 
 @cmd("stats")
@@ -932,11 +1045,13 @@ def post_commands_mention(event, say, client=None):
         kwargs["thread_ts"] = thread
     try:
         say(**kwargs)
+        play_gif(client, event.get("channel"), GIF_REPLY, None, thread)
         return
     except Exception as e:
         print("app_mention thread reply failed, trying channel root:", repr(e))
     try:
         say(text=INTRO, blocks=blocks)
+        play_gif(client, event.get("channel"), GIF_REPLY, None, thread)
         return
     except Exception as e2:
         print("app_mention channel reply failed, trying ephemeral:", repr(e2))
@@ -1074,6 +1189,7 @@ def bj_finish(g, natural=False):
     games.pop(g["gid"], None)
     g["result"] = (label, profit)
     glog(uid, f"played blackjack (bet {fmt(bet)})", f"{label} {signed(profit)}")
+    celebrate(uid, profit)
     return g["result"]
 
 
@@ -1114,6 +1230,7 @@ def blackjack(uid, args):
 @app.action(re.compile(r"^bj_(hit|stand|double)$"))
 def bj_action(ack, body, respond, client, action):
     ack()
+    set_ctx(client, body)
     with lock:
         g = games.get(action["value"])
         if not g:
@@ -1126,7 +1243,7 @@ def bj_action(ack, body, respond, client, action):
         if kind == "bj_hit":
             g["p"].append(g["deck"].pop())
             if hand_val(g["p"]) < 21:
-                swap(respond, bj_view(g))
+                swap(respond, bj_view(g), client, body)
                 return
         elif kind == "bj_double":
             if len(g["p"]) != 2 or get(g["uid"])[0] < g["bet"]:
@@ -1136,7 +1253,7 @@ def bj_action(ack, body, respond, client, action):
             g["bet"] *= 2
             g["p"].append(g["deck"].pop())
         bj_finish(g)
-        swap(respond, bj_view(g, True))
+        swap(respond, bj_view(g, True), client, body)
 
 
 # ----- "play again" buttons -----
@@ -1147,6 +1264,7 @@ def again_dispatch(kind, uid, bet_text):
 @app.action(re.compile(r"^(bj|slots|hl|rr)_again$"))
 def again_action(ack, body, respond, client, action):
     ack()
+    set_ctx(client, body)
     kind = action["action_id"].split("_")[0]
     uid, bet = action["value"].split(":")
     with lock:
@@ -1157,7 +1275,7 @@ def again_action(ack, body, respond, client, action):
         if isinstance(v, str):
             only_you(client, respond, body, v)
         else:
-            swap(respond, v)
+            swap(respond, v, client, body)
 
 
 # ----- slots -----
@@ -1181,6 +1299,7 @@ def slots_play(uid, bet_text):
     if bet + profit:
         change(uid, cash=bet + profit)
     glog(uid, f"spun the slots (bet {fmt(bet)})", f"{' '.join(reels)} {label} {signed(profit)}")
+    celebrate(uid, profit)
     color = C_GREEN if profit > 0 else C_RED
     return embed(f"🎰 *Slots* · {tag(uid)} · bet {fmt(bet)}\n\n>  {'   |   '.join(reels)}\n\n*Result:* {label}  *{signed(profit)}*",
                  color, nolog=True, footer="3x 7️⃣ = 30x · 3x 💎 = 15x · 3x 🔔 = 8x · any other 3 = 4x · pair = 1x",
@@ -1234,6 +1353,7 @@ def higher_lower(uid, args):
 @app.action(re.compile(r"^hl_(higher|lower)$"))
 def hl_action(ack, body, respond, client, action):
     ack()
+    set_ctx(client, body)
     with lock:
         g = hl_games.get(action["value"])
         if not g:
@@ -1255,11 +1375,13 @@ def hl_action(ack, body, respond, client, action):
         else:
             profit = -bet
         glog(uid, f"played higher-lower (bet {fmt(bet)})", f"{card(c)} then {card(nxt)} {signed(profit)}")
+        celebrate(uid, profit)
         swap(respond, embed(
             f"🔼 *Higher or Lower* · {tag(uid)} · bet {fmt(bet)}\n\n{card(c)} → {card(nxt)}\n"
             f"*Result:* {'You win!' if won else 'You lose'}  *{signed(profit)}*",
             C_GREEN if won else C_RED, nolog=True,
-            buttons=[btn("▶️ Play Again", "hl_again", f"{uid}:{bet}", "primary"), HELP_BTN]))
+            buttons=[btn("▶️ Play Again", "hl_again", f"{uid}:{bet}", "primary"), HELP_BTN]),
+            client, body)
 
 
 # ----- russian roulette -----
@@ -1275,6 +1397,7 @@ def rr_play(uid, bet_text):
         change(uid, cash=bet + profit)
         text, color = "🔫 *click…* The chamber was empty, you survive!", C_GREEN
     glog(uid, f"played russian roulette (bet {fmt(bet)})", signed(profit))
+    celebrate(uid, profit)
     return embed(f"{text}\n{tag(uid)} bet {fmt(bet)} · *Result:* *{signed(profit)}*", color, nolog=True,
                  footer="1 bullet in 6 chambers. Survive to win 20% of your bet.",
                  buttons=[btn("🔫 Again", "rr_again", f"{uid}:{bet}", "danger"), HELP_BTN])
@@ -1310,6 +1433,7 @@ def rps(uid, args):
 @app.action(re.compile(r"^rps_(rock|paper|scissors)$"))
 def rps_action(ack, body, respond, client, action):
     ack()
+    set_ctx(client, body)
     with lock:
         g = rps_games.get(action["value"])
         if not g:
@@ -1331,9 +1455,10 @@ def rps_action(ack, body, respond, client, action):
             change(uid, cash=bet + profit)
         rps_games.pop(action["value"], None)
         glog(uid, f"played rps vs the bot (bet {fmt(bet)})", f"{me} vs {bot_move}: {res} {signed(profit)}")
+        celebrate(uid, profit)
         swap(respond, embed(f"✊ *Rock Paper Scissors* · {tag(uid)} bet {fmt(bet)}\n"
                             f"You: {RPS[me]} {me}  vs  Bot: {RPS[bot_move]} {bot_move}\n*{res}*  *{signed(profit)}*",
-                            color, nolog=True, buttons=[HELP_BTN]))
+                            color, nolog=True, buttons=[HELP_BTN]), client, body)
 
 
 # ---------- roulette ----------
@@ -1413,6 +1538,7 @@ def roulette_spin(ch):
         lines = []
         for uid, (won, lost) in results.items():
             net = won - lost
+            celebrate(uid, net)
             lines.append(f"{'✅' if net > 0 else ('➖' if net == 0 else '❌')} <@{uid}> *{signed(net)}*")
             glog(uid, "played roulette", f"ball on {color} {n}: {signed(net)}")
         total = sum(b[1] for b in g["bets"])
@@ -1447,6 +1573,9 @@ def pvp_win(winner, bet):
 
 def win_text(winner, loser, bet, gain=None):
     gain = bet * (1 + PVP_BONUS) if gain is None else gain
+    celebrate(winner, gain)
+    if bet:
+        celebrate(loser, -bet)
     return f"🏆 {tag(winner)} wins" + (f" *{fmt(gain)}* ({tag(loser)} loses {fmt(bet)})!" if bet else "!")
 
 
@@ -1513,6 +1642,7 @@ def replace(respond, text, extra_blocks=None):
 @app.action(re.compile(r"^ch_(accept|decline)$"))
 def ch_action(ack, body, respond, client, action):
     ack()
+    set_ctx(client, body)
     with lock:
         gid, user = action["value"], body["user"]["id"]
         c = challenges.get(gid)
@@ -1572,6 +1702,7 @@ def rps_view(g):
 @app.action(re.compile(r"^prps_(rock|paper|scissors)$"))
 def prps_action(ack, body, respond, client, action):
     ack()
+    set_ctx(client, body)
     with lock:
         g = pvp.get(action["value"])
         user = body["user"]["id"]
@@ -1643,6 +1774,7 @@ def bj2_result(g):
 @app.action(re.compile(r"^pbj_(hit|stand|hand)$"))
 def pbj_action(ack, body, respond, client, action):
     ack()
+    set_ctx(client, body)
     with lock:
         g = pvp.get(action["value"])
         user = body["user"]["id"]
@@ -1717,6 +1849,7 @@ def ttt(uid, args):
 @app.action("ttt_pick")
 def ttt_action(ack, body, respond, client, action):
     ack()
+    set_ctx(client, body)
     with lock:
         pick = action.get("selected_option") or {}
         if not pick.get("value"):
@@ -1898,7 +2031,8 @@ def cap_total(u, amt):
 @cmd("admin", keep_case=True)
 def admin_cmd(uid, args):
     if uid not in ADMINS:
-        return "🔒 Admins only."
+        return (f"🔒 Admins only. Your Slack ID is `{uid}` — add it to the `ADMINS` set in bot.py "
+                "or set `ADMIN_IDS=" + uid + "` in the environment.")
     if not args or args[0].lower() == "help":
         return ADMIN_HELP
     sub, rest = args[0].lower(), args[1:]
