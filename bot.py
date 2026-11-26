@@ -401,41 +401,84 @@ def clean_name(n):
 
 
 def set_name(uid, name):
+    """The username Slack sends with a command (may be an old handle)."""
     name = clean_name(name)
     if not uid or not name:
         return
     get(uid)
     with lock:
-        db.execute("UPDATE users SET name=? WHERE uid=?", (name, uid))
+        db.execute("UPDATE users SET uname=? WHERE uid=?", (name, uid))
         db.commit()
 
 
-name_cache = {}
-
-
-def name_of(uid):
-    if uid in name_cache:
-        return name_cache[uid]
-    # Fast path: the name we already stored when the player used a command.
-    # Asking Slack for every name is slow (and fails when users:read is
-    # missing), which made the leaderboard buttons time out.
-    with lock:
-        row = db.execute("SELECT name FROM users WHERE uid=?", (uid,)).fetchone()
-    if row and row[0]:
-        name_cache[uid] = row[0]
-        return row[0]
+def refresh_name(uid):
+    """Ask Slack for the display name (the name Slack shows next to a mention)."""
     try:
         info = app.client.users_info(user=uid)["user"]
         p = info.get("profile", {})
         n = clean_name(p.get("display_name") or p.get("real_name") or info.get("name"))
-        if n:
-            name_cache[uid] = n
-            return n
     except Exception as e:
         print("users_info failed (is users:read granted + app reinstalled?):", repr(e))
+        name_fail[uid] = time.time()
+        return
+    if not n:
+        return
     with lock:
-        r = db.execute("SELECT name FROM users WHERE uid=?", (uid,)).fetchone()
-    return r[0] if r and r[0] else "someone"
+        db.execute("UPDATE users SET name=? WHERE uid=?", (n, uid))
+        db.commit()
+    name_cache[uid] = [n, time.time()]
+    name_fail.pop(uid, None)
+
+
+name_cache = {}       # uid -> [name, when we checked]
+name_fail = {}        # uid -> when the Slack lookup last failed
+NAME_TTL = 1800       # how long a display name is trusted
+NAME_RETRY = 600      # wait this long before asking Slack again after a failure
+refreshing = set()
+
+
+def name_of(uid):
+    """The player's display name. Never waits for Slack: a slow lookup used to
+    make the leaderboard buttons time out and do nothing."""
+    now = time.time()
+    hit = name_cache.get(uid)
+    if hit and now - hit[1] < NAME_TTL:
+        return hit[0]
+    with lock:
+        row = db.execute("SELECT name, uname FROM users WHERE uid=?", (uid,)).fetchone()
+    display = row[0] if row else None
+    uname = row[1] if row else None
+    name = display or uname or (hit[0] if hit else "someone")
+    name_cache[uid] = [name, now]
+    # refresh the display name in the background (never blocks the reply)
+    if not display and uid not in refreshing and now - name_fail.get(uid, 0) > NAME_RETRY:
+        refreshing.add(uid)
+        def worker():
+            try:
+                refresh_name(uid)
+            finally:
+                refreshing.discard(uid)
+        threading.Thread(target=worker, daemon=True).start()
+    return name
+
+
+def migrate_names():
+    """The old "name" column held Slack usernames; move them to "uname" so that
+    "name" can hold the real display name (what Slack shows)."""
+    with lock:
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN uname TEXT")
+        except sqlite3.OperationalError:
+            pass
+        if not setting("names_v2", 0):
+            db.execute("UPDATE users SET uname=name WHERE name IS NOT NULL AND name!=''")
+            db.execute("UPDATE users SET name=NULL")
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('names_v2','1')")
+            db.commit()
+            print("moved stored usernames to users.uname (display names refresh from Slack)")
+
+
+migrate_names()
 
 
 MARK = re.compile(r"⟦(\w+)⟧")
@@ -688,15 +731,18 @@ def with_usage(err, usage):
 
 
 def wealth_factor(uid):
+    """Payout shrink for the very rich, as a whole percent (no floats, so huge
+    bets stay exact)."""
     c, b = get(uid)
-    for limit, f in ((100_000_000, .55), (10_000_000, .65), (1_000_000, .75), (100_000, .85)):
+    for limit, pct in ((100_000_000, 55), (10_000_000, 65), (1_000_000, 75), (100_000, 85)):
         if c + b >= limit:
-            return f
-    return 1.0
+            return pct
+    return 100
 
 
 def win_profit(uid, bet, mult):
-    return max(1, int(bet * mult * wealth_factor(uid)))
+    # pure integer math: a bet above 2^53 would get rounded by float maths
+    return max(1, bet * mult * wealth_factor(uid) // 100)
 
 
 def inv_amount(uid, name):
@@ -914,11 +960,45 @@ def leaderboard(uid, args):
     return lb_view(uid, page)
 
 
+def post_page(client, body, view):
+    """Show a leaderboard page as its own message.
+
+    Updating the old message in place works only sometimes (Slack quietly
+    refuses to replace some ephemeral messages), and when it is refused the
+    button looks completely dead. Posting the page as a fresh ephemeral
+    message always works.
+    """
+    if client is None or body is None:
+        return False
+    v = wire(render(view, False))
+    v.pop("nolog", None)
+    v.pop("response_type", None)
+    if not v.get("text"):
+        v["text"] = plain_text(v)
+    try:
+        client.chat_postEphemeral(channel=(body.get("channel") or {}).get("id"),
+                                  user=body["user"]["id"],
+                                  text=v.get("text", ""),
+                                  attachments=v.get("attachments"))
+        return True
+    except Exception as e:
+        print("could not post the new page:", repr(e))
+        return False
+
+
 @app.action("lb_page")
 def lb_page(ack, body, respond, client, action):
     ack()
-    uid, page = action["value"].split(":")
-    swap(respond, lb_view(body["user"]["id"], int(page)), client, body)
+    try:
+        _, page = (action.get("value") or ":1").split(":")[:2]
+        view = lb_view(body["user"]["id"], int(page))
+    except Exception as e:
+        print("leaderboard page failed:", repr(e))
+        return
+    if post_page(client, body, view):
+        return
+    # last resort: replace the old message in place
+    swap(respond, view, client, body)
 
 
 @cmd("stats")
@@ -961,7 +1041,7 @@ def crime(uid, args):
         change(uid, cash=win)
         return embed(f"🕵️ You {random.choice(CRIME_WIN)} and got {fmt(win)}.", C_GREEN, buttons=remind)
     cash, bank = get(uid)
-    fine = max(25, min(2000, int(max(cash, 0) * random.randint(10, 20) / 100)))
+    fine = max(25, min(2000, max(cash, 0) * random.randint(10, 20) // 100))
     from_cash = min(max(cash, 0), fine)
     from_bank = min(bank, fine - from_cash)
     change(uid, cash=-from_cash, bank=-from_bank)
@@ -992,11 +1072,11 @@ def rob(uid, args):
         return wait_view("rob", left)
     if random.random() < 0.50:
         pct = random.randint(40, 90)
-        win = max(1, int(t_cash * pct / 100))
+        win = max(1, t_cash * pct // 100)
         change(target, cash=-win)
         change(uid, cash=win)
         return f"🕶️ {tag(uid)} robbed {tag(target)} and took {fmt(win)} ({pct}% of their cash)!"
-    loss = min(my_cash, max(50, int(my_cash * random.randint(15, 30) / 100)))
+    loss = min(my_cash, max(50, my_cash * random.randint(15, 30) // 100))
     change(uid, cash=-loss)
     change(target, cash=loss)
     return f"🚔 {tag(uid)} got caught robbing {tag(target)} and had to pay them {fmt(loss)}!"
@@ -1471,7 +1551,8 @@ def roulette_space(space):
     if space in ("red", "black"):
         return space, 2, lambda n: n != 0 and ((n in RED) == (space == "red"))
     if space in ("odd", "even"):
-        return space, 2, lambda n: n != 0 and (n % 2 == (1 if space == "odd" else 0))
+        # 0 counts as even, so an "even" bet wins when the ball lands on 0
+        return space, 2, lambda n: (n % 2 == 1) if space == "odd" else (n % 2 == 0)
     if space in ("1-18", "19-36"):
         lo, hi = map(int, space.split("-"))
         return space, 2, lambda n: lo <= n <= hi
@@ -1543,7 +1624,8 @@ def roulette_spin(ch):
             glog(uid, "played roulette", f"ball on {color} {n}: {signed(net)}")
         total = sum(b[1] for b in g["bets"])
     text = f"🎡 *The ball landed on {color} {n}!*\n" + "\n".join(lines)
-    body = {"text": text.replace("*", ""), "attachments": [{"color": {"red": C_RED, "black": C_GREY, "green": C_GREEN}[color],
+    body = {"text": f"🎡 The ball landed on {color} {n}!",
+            "attachments": [{"color": {"red": C_RED, "black": C_GREY, "green": C_GREEN}[color],
             "blocks": [section(text), {"type": "context", "elements": [{"type": "mrkdwn", "text": f"{len(results)} player(s) · {fmt(total)} bet in total"}]}]}]}
     try:
         app.client.chat_postMessage(channel=ch, **wire(body))
